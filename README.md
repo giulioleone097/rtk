@@ -1,3 +1,15 @@
+# tokenaut
+
+This branch is **tokenaut**, a fork of [rtk](https://github.com/rtk-ai/rtk) 0.48.0. The crate, the
+binary and the config directory are named `tokenaut`: rewritten commands are spelled
+`tokenaut git status`, the Claude Code hook command is `tokenaut hook claude`, and state lives in
+`<platform config dir>/tokenaut` (an existing `rtk` directory is copied over on first run). It adds
+`tokenaut bench`, which replays candidate filters over recent Claude Code transcripts, and
+`tokenaut bench --gaps`, which ranks the Bash producers whose bytes the rewrite engine does not
+capture. Everything below is the upstream rtk README, unchanged.
+
+---
+
 <p align="center">
   <img src="https://avatars.githubusercontent.com/u/258253854?v=4" alt="RTK - Rust Token Killer" width="500">
 </p>

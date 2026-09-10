@@ -224,9 +224,9 @@ mod tests {
     #[test]
     fn test_count_all_rtk() {
         let cmds = vec![
-            make_cmd("rtk git status", Some(200)),
-            make_cmd("rtk cargo test", Some(5000)),
-            make_cmd("rtk git log -10", Some(800)),
+            make_cmd("tokenaut git status", Some(200)),
+            make_cmd("tokenaut cargo test", Some(5000)),
+            make_cmd("tokenaut git log -10", Some(800)),
         ];
         let (total, rtk, output) = count_rtk_commands(&cmds);
         assert_eq!(total, 3);
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn test_count_hook_rewritten_commands() {
-        // Hook rewrites "git status" → "rtk git status" but JSONL logs the original.
+        // Hook rewrites "git status" → "tokenaut git status" but JSONL logs the original.
         // count_rtk_commands should detect these via classify_command.
         let cmds = vec![
             make_cmd("git status", Some(500)),
@@ -253,10 +253,10 @@ mod tests {
     #[test]
     fn test_count_mixed_explicit_and_hook() {
         let cmds = vec![
-            make_cmd("rtk git status", Some(200)),  // explicit rtk
-            make_cmd("git log -5", Some(1000)),     // hook-rewritten (logged as raw)
-            make_cmd("rtk cargo test", Some(5000)), // explicit rtk
-            make_cmd("echo hello", None),           // not supported
+            make_cmd("tokenaut git status", Some(200)), // explicit rtk
+            make_cmd("git log -5", Some(1000)),         // hook-rewritten (logged as raw)
+            make_cmd("tokenaut cargo test", Some(5000)), // explicit rtk
+            make_cmd("echo hello", None),               // not supported
         ];
         let (total, rtk, output) = count_rtk_commands(&cmds);
         assert_eq!(total, 4);
@@ -282,12 +282,15 @@ mod tests {
         // not count as adopted rtk usage, or the session report would flatter
         // itself via its own escape hatch (mirrors discover::is_already_rtk).
         let cmds = vec![
-            make_cmd("rtk proxy git log -20", Some(2000)),
-            make_cmd("rtk git status", Some(200)),
+            make_cmd("tokenaut proxy git log -20", Some(2000)),
+            make_cmd("tokenaut git status", Some(200)),
         ];
         let (total, rtk, _) = count_rtk_commands(&cmds);
         assert_eq!(total, 2);
-        assert_eq!(rtk, 1, "only the explicit non-proxy rtk invocation counts");
+        assert_eq!(
+            rtk, 1,
+            "only the explicit non-proxy tokenaut invocation counts"
+        );
     }
 
     #[test]
@@ -305,10 +308,10 @@ mod tests {
     fn test_count_chained_commands_split() {
         // "cd ./path && rtk ls" is one ExtractedCommand but two logical commands.
         // cd is ignored/unsupported, ls is supported → 1 out of 2 covered.
-        let cmds = vec![make_cmd("cd ./your/app/path && rtk ls", Some(200))];
+        let cmds = vec![make_cmd("cd ./your/app/path && tokenaut ls", Some(200))];
         let (total, rtk, _) = count_rtk_commands(&cmds);
         assert_eq!(total, 2, "chain should split into 2 commands");
-        assert_eq!(rtk, 1, "only 'rtk ls' is RTK-covered");
+        assert_eq!(rtk, 1, "only 'tokenaut ls' is RTK-covered");
     }
 
     #[test]
@@ -369,11 +372,11 @@ mod tests {
     fn test_parse_jsonl_session_and_count() {
         // Simulate a session with 3 Bash commands: 2 rtk, 1 raw
         let jsonl = [
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"rtk git status"}}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"tokenaut git status"}}]}}"#,
             r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"On branch main"}]}}"#,
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"git log -5"}}]}}"#,
             r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"commit abc123\ncommit def456"}]}}"#,
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"rtk cargo test"}}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"tokenaut cargo test"}}]}}"#,
             r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t3","content":"test result: ok. 5 passed"}]}}"#,
         ];
 
@@ -387,7 +390,7 @@ mod tests {
 
         let (total, rtk, _output) = count_rtk_commands(&cmds);
         assert_eq!(total, 3, "should find 3 Bash commands");
-        // All 3 are RTK-covered: 2 explicit "rtk ..." + 1 hook-rewritten "git log"
+        // All 3 are RTK-covered: 2 explicit "tokenaut ..." + 1 hook-rewritten "git log"
         assert_eq!(rtk, 3, "all 3 commands should be RTK-covered");
     }
 
@@ -397,7 +400,7 @@ mod tests {
         let jsonl = [
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/tmp/foo"}}]}}"#,
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Grep","input":{"pattern":"TODO"}}]}}"#,
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"rtk git status"}}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"tokenaut git status"}}]}}"#,
             r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t3","content":"clean"}]}}"#,
         ];
 
@@ -438,7 +441,7 @@ mod tests {
         // Claude often runs "cd ./path && git status" as a single Bash call.
         // The adoption metric should split the chain and count each part.
         let jsonl = [
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cd ./your/app/path && rtk ls"}}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cd ./your/app/path && tokenaut ls"}}]}}"#,
             r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"file1.rs\nfile2.rs"}]}}"#,
         ];
 
@@ -452,7 +455,7 @@ mod tests {
 
         assert_eq!(cmds.len(), 1, "one Bash tool call");
         let (total, rtk, _) = count_rtk_commands(&cmds);
-        assert_eq!(total, 2, "chain splits into cd + rtk ls");
-        assert_eq!(rtk, 1, "rtk ls is covered, cd is not");
+        assert_eq!(total, 2, "chain splits into cd + tokenaut ls");
+        assert_eq!(rtk, 1, "tokenaut ls is covered, cd is not");
     }
 }

@@ -63,9 +63,9 @@ pub enum AgentTarget {
 
 #[derive(Parser)]
 #[command(
-    name = "rtk",
+    name = "tokenaut",
     version,
-    about = "Rust Token Killer - Minimize LLM token consumption",
+    about = "tokenaut - Minimize LLM token consumption (fork of rtk 0.48.0)",
     long_about = "A high-performance CLI proxy designed to filter and summarize system outputs before they reach your LLM context."
 )]
 struct Cli {
@@ -912,6 +912,19 @@ enum Commands {
         #[command(subcommand)]
         command: HookCommands,
     },
+
+    /// Replay candidate filters over recent Claude Code transcripts
+    Bench {
+        /// How far back to scan transcripts
+        #[arg(long, default_value_t = 14)]
+        days: u64,
+        /// Claude Code config directory to scan (repeatable)
+        #[arg(long = "config-dir")]
+        config_dir: Vec<PathBuf>,
+        /// Report the not-rewritten Bash producers by bytes instead
+        #[arg(long)]
+        gaps: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1720,6 +1733,10 @@ fn main() {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+
+    // Before anything reads config.toml or the tracking database: this fork renamed
+    // the state directory, so an upstream one is adopted on the first run.
+    core::utils::adopt_legacy_state_dirs();
 
     let code = match run_cli() {
         Ok(code) => code,
@@ -2715,6 +2732,16 @@ fn run_cli() -> Result<i32> {
                 }
             }
         },
+
+        Commands::Bench {
+            days,
+            config_dir,
+            gaps,
+        } => {
+            // A lost citation is a failing bench, not an error the CLI should
+            // print a message for, so the exit code is returned directly.
+            cmds::bench::run(days, &config_dir, gaps)
+        }
 
         Commands::Rewrite { args } => {
             let cmd = args.join(" ");

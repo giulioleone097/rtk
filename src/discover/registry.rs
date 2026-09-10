@@ -1,5 +1,6 @@
 //! Matches shell commands against known RTK rewrite rules to decide how to handle them.
 
+use crate::core::constants::BIN;
 use crate::core::utils::composer_bin_dirs;
 use regex::{Regex, RegexSet};
 use std::path::Path;
@@ -12,6 +13,12 @@ use super::lexer::{
 use super::rules::{RtkRule, IGNORED_EXACT, IGNORED_PREFIXES, RULES};
 
 const PHP_TOOL_NAMES: [&str; 6] = ["phpunit", "phpstan", "ecs", "pest", "paratest", "pint"];
+
+/// The tool part of an already-rewritten command: `Some("git status")` for
+/// `"tokenaut git status"`, `None` for anything the fork did not produce.
+fn strip_bin_prefix(command: &str) -> Option<&str> {
+    command.strip_prefix(BIN)?.strip_prefix(' ')
+}
 
 /// Result of classifying a command.
 #[derive(Debug, PartialEq)]
@@ -648,7 +655,7 @@ fn rewrite_single(
         || trimmed.contains(';')
         || trimmed.contains('|')
         || trimmed.contains(" & ");
-    if !has_compound && (trimmed.starts_with("rtk ") || trimmed == "rtk") {
+    if !has_compound && (strip_bin_prefix(trimmed).is_some() || trimmed == BIN) {
         return Some(trimmed.to_string());
     }
 
@@ -1324,7 +1331,7 @@ fn rewrite_line_range(cmd: &str) -> Option<String> {
         if let Some(caps) = re.captures(cmd) {
             let n = caps.get(1)?.as_str();
             let file = caps.get(2)?.as_str();
-            return Some(format!("rtk read {} --max-lines {}", file, n));
+            return Some(format!("{BIN} read {} --max-lines {}", file, n));
         }
     }
     if cmd.starts_with("head -") {
@@ -1339,7 +1346,7 @@ fn rewrite_line_range(cmd: &str) -> Option<String> {
         if let Some(caps) = re.captures(cmd) {
             let n = caps.get(1)?.as_str();
             let file = caps.get(2)?.as_str();
-            return Some(format!("rtk read {} --tail-lines {}", file, n));
+            return Some(format!("{BIN} read {} --tail-lines {}", file, n));
         }
     }
     None
@@ -1387,7 +1394,7 @@ fn search_uses_pattern_file(cmd: &str) -> bool {
 }
 
 fn pipeline_final_command_is_safe(rtk_cmd: &str, cmd: &str) -> bool {
-    !matches!(rtk_cmd, "rtk grep" | "rtk rg") || !search_uses_pattern_file(cmd)
+    !matches!(rtk_cmd, "tokenaut grep" | "tokenaut rg") || !search_uses_pattern_file(cmd)
 }
 
 pub(crate) enum ExcludePattern {
@@ -1540,7 +1547,7 @@ fn rewrite_segment_inner(
     let (cmd_part, redirect_suffix) = strip_trailing_redirects(trimmed);
 
     // Already RTK — pass through unchanged
-    if cmd_part.starts_with("rtk ") || cmd_part == "rtk" {
+    if strip_bin_prefix(cmd_part).is_some() || cmd_part == BIN {
         return Some(trimmed.to_string());
     }
 
@@ -1596,7 +1603,7 @@ fn rewrite_segment_inner(
                 return None;
             }
             if crate::core::toml_filter::command_matches_filter(&normalized) {
-                return Some(format!("rtk {}{}", cmd_part, redirect_suffix));
+                return Some(format!("{BIN} {}{}", cmd_part, redirect_suffix));
             }
             return None;
         }
@@ -1613,10 +1620,10 @@ fn rewrite_segment_inner(
 
     if let Some(parts) = parse_golangci_run_parts(cmd_part) {
         let rewritten = if parts.global_segment.is_empty() {
-            format!("rtk golangci-lint {}", parts.run_segment)
+            format!("{BIN} golangci-lint {}", parts.run_segment)
         } else {
             format!(
-                "rtk golangci-lint {} {}",
+                "{BIN} golangci-lint {} {}",
                 parts.global_segment, parts.run_segment
             )
         };
@@ -1625,7 +1632,7 @@ fn rewrite_segment_inner(
 
     // #196: gh with --json/--jq/--template produces structured output that
     // rtk gh would corrupt — skip rewrite so the caller gets raw JSON.
-    if rule.rtk_cmd == "rtk gh" {
+    if rule.rtk_cmd == "tokenaut gh" {
         let args_lower = cmd_part.to_lowercase();
         if args_lower.contains("--json")
             || args_lower.contains("--jq")
@@ -1694,9 +1701,7 @@ fn tool_portion(prefix: &'static str, rule: &RtkRule) -> &'static str {
 /// `normalize_php_tool_command` only strips `./` for paths that resolve to a Composer
 /// tool, so a plain `./bin/<tool>` would otherwise survive and miss the prefix match.
 fn php_tool_form(cmd: &str, rtk_cmd: &str) -> Option<String> {
-    rtk_cmd
-        .strip_prefix("rtk ")
-        .filter(|t| PHP_TOOL_NAMES.contains(t))?;
+    strip_bin_prefix(rtk_cmd).filter(|t| PHP_TOOL_NAMES.contains(t))?;
     let unwrapped = strip_php_wrapper(cmd);
     let unwrapped = unwrapped.strip_prefix("./").unwrap_or(unwrapped);
     Some(normalize_php_tool_command(unwrapped))
@@ -1758,7 +1763,7 @@ mod tests {
         fn test_rewrites_each_line() {
             assert_eq!(
                 rewrite_command_no_prefixes("git status\ngit log --oneline -3", &[]),
-                Some("rtk git status\nrtk git log --oneline -3".into())
+                Some("tokenaut git status\ntokenaut git log --oneline -3".into())
             );
         }
 
@@ -1766,7 +1771,7 @@ mod tests {
         fn test_preserves_blank_lines_comments_and_indentation() {
             assert_eq!(
                 rewrite_command_no_prefixes("git status\n\n# check history\n  git log -3", &[]),
-                Some("rtk git status\n\n# check history\n  rtk git log -3".into())
+                Some("tokenaut git status\n\n# check history\n  tokenaut git log -3".into())
             );
         }
 
@@ -1774,7 +1779,7 @@ mod tests {
         fn test_compound_line_inside_block() {
             assert_eq!(
                 rewrite_command_no_prefixes("cd /tmp && git status\ngrep -rn foo src", &[]),
-                Some("cd /tmp && rtk git status\nrtk grep -rn foo src".into())
+                Some("cd /tmp && tokenaut git status\ntokenaut grep -rn foo src".into())
             );
         }
 
@@ -1782,7 +1787,7 @@ mod tests {
         fn test_crlf_separators_preserved() {
             assert_eq!(
                 rewrite_command_no_prefixes("git status\r\ngit log -3", &[]),
-                Some("rtk git status\r\nrtk git log -3".into())
+                Some("tokenaut git status\r\ntokenaut git log -3".into())
             );
         }
 
@@ -1792,11 +1797,11 @@ mod tests {
             // the whole thing is one logical command and gets one prefix.
             assert_eq!(
                 rewrite_command_no_prefixes("git commit -m \"subject\ngit status in body\"", &[]),
-                Some("rtk git commit -m \"subject\ngit status in body\"".into())
+                Some("tokenaut git commit -m \"subject\ngit status in body\"".into())
             );
             assert_eq!(
                 rewrite_command_no_prefixes("git commit -m 'multi\nline\nmessage'", &[]),
-                Some("rtk git commit -m 'multi\nline\nmessage'".into())
+                Some("tokenaut git commit -m 'multi\nline\nmessage'".into())
             );
         }
 
@@ -1839,7 +1844,7 @@ mod tests {
                     "git status # isn't it what's expected\ngit log -3",
                     &[]
                 ),
-                Some("rtk git status # isn't it what's expected\nrtk git log -3".into())
+                Some("tokenaut git status # isn't it what's expected\ntokenaut git log -3".into())
             );
         }
 
@@ -1898,7 +1903,7 @@ mod tests {
         fn test_ansi_c_without_escaped_quote_still_rewrites() {
             assert_eq!(
                 rewrite_command_no_prefixes("echo $'a\\tb'\ngit status", &[]),
-                Some("echo $'a\\tb'\nrtk git status".into())
+                Some("echo $'a\\tb'\ntokenaut git status".into())
             );
         }
 
@@ -1908,11 +1913,11 @@ mod tests {
             // unbalanced-grouping bail.
             assert_eq!(
                 rewrite_command_no_prefixes("echo ${HOME}\ngit status", &[]),
-                Some("echo ${HOME}\nrtk git status".into())
+                Some("echo ${HOME}\ntokenaut git status".into())
             );
             assert_eq!(
                 rewrite_command_no_prefixes("echo \"${HOME}\"\ngit status", &[]),
-                Some("echo \"${HOME}\"\nrtk git status".into())
+                Some("echo \"${HOME}\"\ntokenaut git status".into())
             );
         }
 
@@ -1924,7 +1929,7 @@ mod tests {
         #[test]
         fn test_already_rtk_lines_count_as_unchanged() {
             assert_eq!(
-                rewrite_command_no_prefixes("rtk git status\necho done", &[]),
+                rewrite_command_no_prefixes("tokenaut git status\necho done", &[]),
                 None
             );
         }
@@ -1932,8 +1937,8 @@ mod tests {
         #[test]
         fn test_mixed_rtk_and_rewritable_line() {
             assert_eq!(
-                rewrite_command_no_prefixes("rtk git status\ngit log -3", &[]),
-                Some("rtk git status\nrtk git log -3".into())
+                rewrite_command_no_prefixes("tokenaut git status\ngit log -3", &[]),
+                Some("tokenaut git status\ntokenaut git log -3".into())
             );
         }
 
@@ -1957,7 +1962,7 @@ mod tests {
         fn test_cross_line_and_list_joins_and_rewrites() {
             assert_eq!(
                 rewrite_command_no_prefixes("git status &&\ngit log -3", &[]),
-                Some("rtk git status && rtk git log -3".into())
+                Some("tokenaut git status && tokenaut git log -3".into())
             );
         }
 
@@ -1965,7 +1970,7 @@ mod tests {
         fn test_cross_line_pipeline_joins_and_rewrites() {
             assert_eq!(
                 rewrite_command_no_prefixes("git log |\ngrep feat", &[]),
-                Some("git log | rtk grep feat".into())
+                Some("git log | tokenaut grep feat".into())
             );
             assert_eq!(
                 rewrite_command_no_prefixes("cargo test |&\ngrep FAILED", &[]),
@@ -1985,7 +1990,9 @@ mod tests {
         fn test_mixed_independent_and_continued_lines() {
             assert_eq!(
                 rewrite_command_no_prefixes("grep -rn foo src\ngit status &&\ngit log -3", &[]),
-                Some("rtk grep -rn foo src\nrtk git status && rtk git log -3".into())
+                Some(
+                    "tokenaut grep -rn foo src\ntokenaut git status && tokenaut git log -3".into()
+                )
             );
         }
 
@@ -1993,7 +2000,7 @@ mod tests {
         fn test_blank_line_inside_continuation_joins() {
             assert_eq!(
                 rewrite_command_no_prefixes("git status &&\n\ngit log -3", &[]),
-                Some("rtk git status && rtk git log -3".into())
+                Some("tokenaut git status && tokenaut git log -3".into())
             );
         }
 
@@ -2029,7 +2036,7 @@ mod tests {
         fn test_balanced_conditional_line_still_rewrites() {
             assert_eq!(
                 rewrite_command_no_prefixes("[[ -x foo ]] &&\ngit status", &[]),
-                Some("[[ -x foo ]] && rtk git status".into())
+                Some("[[ -x foo ]] && tokenaut git status".into())
             );
         }
 
@@ -2128,7 +2135,7 @@ mod tests {
             .map(|rule| rule.rtk_cmd)
             .collect();
 
-        assert_eq!(safe_rules, vec!["rtk grep", "rtk rg"]);
+        assert_eq!(safe_rules, vec!["tokenaut grep", "tokenaut rg"]);
     }
 
     #[test]
@@ -2153,7 +2160,7 @@ mod tests {
         assert_eq!(
             classify_command("git status"),
             Classification::Supported {
-                rtk_equivalent: "rtk git",
+                rtk_equivalent: "tokenaut git",
                 category: "Git",
                 estimated_savings_pct: 70.0,
                 status: RtkStatus::Existing,
@@ -2166,7 +2173,7 @@ mod tests {
         assert_eq!(
             classify_command("yadm status"),
             Classification::Supported {
-                rtk_equivalent: "rtk git",
+                rtk_equivalent: "tokenaut git",
                 category: "Git",
                 estimated_savings_pct: 70.0,
                 status: RtkStatus::Existing,
@@ -2179,7 +2186,7 @@ mod tests {
         assert_eq!(
             classify_command("yadm diff"),
             Classification::Supported {
-                rtk_equivalent: "rtk git",
+                rtk_equivalent: "tokenaut git",
                 category: "Git",
                 estimated_savings_pct: 80.0,
                 status: RtkStatus::Existing,
@@ -2191,7 +2198,7 @@ mod tests {
     fn test_rewrite_yadm_status() {
         assert_eq!(
             rewrite_command_no_prefixes("yadm status", &[]),
-            Some("rtk git status".to_string())
+            Some("tokenaut git status".to_string())
         );
     }
 
@@ -2200,7 +2207,7 @@ mod tests {
         assert_eq!(
             classify_command("git diff --cached"),
             Classification::Supported {
-                rtk_equivalent: "rtk git",
+                rtk_equivalent: "tokenaut git",
                 category: "Git",
                 estimated_savings_pct: 80.0,
                 status: RtkStatus::Existing,
@@ -2213,7 +2220,7 @@ mod tests {
         assert_eq!(
             classify_command("cargo test filter::"),
             Classification::Supported {
-                rtk_equivalent: "rtk cargo",
+                rtk_equivalent: "tokenaut cargo",
                 category: "Cargo",
                 estimated_savings_pct: 90.0,
                 status: RtkStatus::Existing,
@@ -2226,7 +2233,7 @@ mod tests {
         assert_eq!(
             classify_command("npx tsc --noEmit"),
             Classification::Supported {
-                rtk_equivalent: "rtk tsc",
+                rtk_equivalent: "tokenaut tsc",
                 category: "Build",
                 estimated_savings_pct: 83.0,
                 status: RtkStatus::Existing,
@@ -2239,7 +2246,7 @@ mod tests {
         assert_eq!(
             classify_command("cat src/main.rs"),
             Classification::Supported {
-                rtk_equivalent: "rtk read",
+                rtk_equivalent: "tokenaut read",
                 category: "Files",
                 estimated_savings_pct: 60.0,
                 status: RtkStatus::Existing,
@@ -2273,7 +2280,10 @@ mod tests {
 
     #[test]
     fn test_classify_rtk_already() {
-        assert_eq!(classify_command("rtk git status"), Classification::Ignored);
+        assert_eq!(
+            classify_command("tokenaut git status"),
+            Classification::Ignored
+        );
     }
 
     #[test]
@@ -2299,7 +2309,7 @@ mod tests {
         assert_eq!(
             classify_command("GIT_SSH_COMMAND=ssh git push"),
             Classification::Supported {
-                rtk_equivalent: "rtk git",
+                rtk_equivalent: "tokenaut git",
                 category: "Git",
                 estimated_savings_pct: 70.0,
                 status: RtkStatus::Existing,
@@ -2312,7 +2322,7 @@ mod tests {
         assert_eq!(
             classify_command("sudo docker ps"),
             Classification::Supported {
-                rtk_equivalent: "rtk docker",
+                rtk_equivalent: "tokenaut docker",
                 category: "Infra",
                 estimated_savings_pct: 85.0,
                 status: RtkStatus::Existing,
@@ -2325,7 +2335,7 @@ mod tests {
         assert_eq!(
             classify_command("cargo check"),
             Classification::Supported {
-                rtk_equivalent: "rtk cargo",
+                rtk_equivalent: "tokenaut cargo",
                 category: "Cargo",
                 estimated_savings_pct: 80.0,
                 status: RtkStatus::Existing,
@@ -2338,7 +2348,7 @@ mod tests {
         assert_eq!(
             classify_command("cargo check --all-targets"),
             Classification::Supported {
-                rtk_equivalent: "rtk cargo",
+                rtk_equivalent: "tokenaut cargo",
                 category: "Cargo",
                 estimated_savings_pct: 80.0,
                 status: RtkStatus::Existing,
@@ -2353,7 +2363,7 @@ mod tests {
         assert_eq!(
             classify_command("cargo fmt"),
             Classification::Supported {
-                rtk_equivalent: "rtk cargo",
+                rtk_equivalent: "tokenaut cargo",
                 category: "Cargo",
                 estimated_savings_pct: 0.0,
                 status: RtkStatus::Passthrough,
@@ -2366,7 +2376,7 @@ mod tests {
         assert_eq!(
             classify_command("cargo clippy --all-targets"),
             Classification::Supported {
-                rtk_equivalent: "rtk cargo",
+                rtk_equivalent: "tokenaut cargo",
                 category: "Cargo",
                 estimated_savings_pct: 80.0,
                 status: RtkStatus::Existing,
@@ -2409,7 +2419,7 @@ mod tests {
         assert_eq!(
             classify_command("find . -name foo"),
             Classification::Supported {
-                rtk_equivalent: "rtk find",
+                rtk_equivalent: "tokenaut find",
                 category: "Files",
                 estimated_savings_pct: 70.0,
                 status: RtkStatus::Existing,
@@ -2468,7 +2478,7 @@ mod tests {
         assert_eq!(
             classify_command("mypy src/"),
             Classification::Supported {
-                rtk_equivalent: "rtk mypy",
+                rtk_equivalent: "tokenaut mypy",
                 category: "Build",
                 estimated_savings_pct: 80.0,
                 status: RtkStatus::Existing,
@@ -2481,7 +2491,7 @@ mod tests {
         assert_eq!(
             classify_command("python3 -m mypy --strict"),
             Classification::Supported {
-                rtk_equivalent: "rtk mypy",
+                rtk_equivalent: "tokenaut mypy",
                 category: "Build",
                 estimated_savings_pct: 80.0,
                 status: RtkStatus::Existing,
@@ -2495,7 +2505,7 @@ mod tests {
     fn test_rewrite_git_status() {
         assert_eq!(
             rewrite_command_no_prefixes("git status", &[]),
-            Some("rtk git status".into())
+            Some("tokenaut git status".into())
         );
     }
 
@@ -2503,7 +2513,7 @@ mod tests {
     fn test_rewrite_git_checkout() {
         assert_eq!(
             rewrite_command_no_prefixes("git checkout main", &[]),
-            Some("rtk git checkout main".into())
+            Some("tokenaut git checkout main".into())
         );
     }
 
@@ -2511,7 +2521,7 @@ mod tests {
     fn test_rewrite_git_log() {
         assert_eq!(
             rewrite_command_no_prefixes("git log -10", &[]),
-            Some("rtk git log -10".into())
+            Some("tokenaut git log -10".into())
         );
     }
 
@@ -2521,7 +2531,7 @@ mod tests {
     fn test_rewrite_git_dash_c_status() {
         assert_eq!(
             rewrite_command_no_prefixes("git -C /path/to/repo status", &[]),
-            Some("rtk git -C /path/to/repo status".into())
+            Some("tokenaut git -C /path/to/repo status".into())
         );
     }
 
@@ -2529,7 +2539,7 @@ mod tests {
     fn test_rewrite_git_dash_c_log() {
         assert_eq!(
             rewrite_command_no_prefixes("git -C /tmp/myrepo log --oneline -5", &[]),
-            Some("rtk git -C /tmp/myrepo log --oneline -5".into())
+            Some("tokenaut git -C /tmp/myrepo log --oneline -5".into())
         );
     }
 
@@ -2537,7 +2547,7 @@ mod tests {
     fn test_rewrite_git_dash_c_diff() {
         assert_eq!(
             rewrite_command_no_prefixes("git -C /home/user/project diff --name-only", &[]),
-            Some("rtk git -C /home/user/project diff --name-only".into())
+            Some("tokenaut git -C /home/user/project diff --name-only".into())
         );
     }
 
@@ -2548,7 +2558,7 @@ mod tests {
             matches!(
                 result,
                 Classification::Supported {
-                    rtk_equivalent: "rtk git",
+                    rtk_equivalent: "tokenaut git",
                     ..
                 }
             ),
@@ -2561,7 +2571,7 @@ mod tests {
     fn test_rewrite_cargo_test() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test", &[]),
-            Some("rtk cargo test".into())
+            Some("tokenaut cargo test".into())
         );
     }
 
@@ -2570,7 +2580,7 @@ mod tests {
         assert_eq!(
             classify_command("ctest -R smoke --output-on-failure"),
             Classification::Supported {
-                rtk_equivalent: "rtk ctest",
+                rtk_equivalent: "tokenaut ctest",
                 category: "Tests",
                 estimated_savings_pct: 80.0,
                 status: RtkStatus::Existing,
@@ -2582,7 +2592,7 @@ mod tests {
     fn test_rewrite_ctest() {
         assert_eq!(
             rewrite_command_no_prefixes("ctest -R smoke --output-on-failure", &[]),
-            Some("rtk ctest -R smoke --output-on-failure".into())
+            Some("tokenaut ctest -R smoke --output-on-failure".into())
         );
     }
 
@@ -2590,7 +2600,7 @@ mod tests {
     fn test_rewrite_compound_and() {
         assert_eq!(
             rewrite_command_no_prefixes("git add . && cargo test", &[]),
-            Some("rtk git add . && rtk cargo test".into())
+            Some("tokenaut git add . && tokenaut cargo test".into())
         );
     }
 
@@ -2601,15 +2611,15 @@ mod tests {
                 "cargo fmt --all && cargo clippy --all-targets && cargo test",
                 &[]
             ),
-            Some("rtk cargo fmt --all && rtk cargo clippy --all-targets && rtk cargo test".into())
+            Some("tokenaut cargo fmt --all && tokenaut cargo clippy --all-targets && tokenaut cargo test".into())
         );
     }
 
     #[test]
     fn test_rewrite_already_rtk() {
         assert_eq!(
-            rewrite_command_no_prefixes("rtk git status", &[]),
-            Some("rtk git status".into())
+            rewrite_command_no_prefixes("tokenaut git status", &[]),
+            Some("tokenaut git status".into())
         );
     }
 
@@ -2617,7 +2627,7 @@ mod tests {
     fn test_rewrite_background_single_amp() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test & git status", &[]),
-            Some("rtk cargo test & rtk git status".into())
+            Some("tokenaut cargo test & tokenaut git status".into())
         );
     }
 
@@ -2625,7 +2635,7 @@ mod tests {
     fn test_rewrite_background_unsupported_right() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test & htop", &[]),
-            Some("rtk cargo test & htop".into())
+            Some("tokenaut cargo test & htop".into())
         );
     }
 
@@ -2634,7 +2644,7 @@ mod tests {
         // `&&` must still work after adding `&` support
         assert_eq!(
             rewrite_command_no_prefixes("cargo test && git status", &[]),
-            Some("rtk cargo test && rtk git status".into())
+            Some("tokenaut cargo test && tokenaut git status".into())
         );
     }
 
@@ -2652,7 +2662,7 @@ mod tests {
     fn test_rewrite_toml_orphan_jj() {
         assert_eq!(
             rewrite_command_no_prefixes("jj log", &[]),
-            Some("rtk jj log".into())
+            Some("tokenaut jj log".into())
         );
     }
 
@@ -2660,7 +2670,7 @@ mod tests {
     fn test_rewrite_toml_orphan_jq() {
         assert_eq!(
             rewrite_command_no_prefixes("jq .", &[]),
-            Some("rtk jq .".into())
+            Some("tokenaut jq .".into())
         );
     }
 
@@ -2668,7 +2678,7 @@ mod tests {
     fn test_rewrite_toml_orphan_just() {
         assert_eq!(
             rewrite_command_no_prefixes("just build", &[]),
-            Some("rtk just build".into())
+            Some("tokenaut just build".into())
         );
     }
 
@@ -2676,7 +2686,7 @@ mod tests {
     fn test_rewrite_toml_absolute_path() {
         assert_eq!(
             rewrite_command_no_prefixes("/usr/bin/jj log", &[]),
-            Some("rtk /usr/bin/jj log".into())
+            Some("tokenaut /usr/bin/jj log".into())
         );
     }
 
@@ -2684,7 +2694,7 @@ mod tests {
     fn test_rewrite_toml_redirect_suffix_preserved() {
         assert_eq!(
             rewrite_command_no_prefixes("jj log 2>&1", &[]),
-            Some("rtk jj log 2>&1".into())
+            Some("tokenaut jj log 2>&1".into())
         );
     }
 
@@ -2692,7 +2702,7 @@ mod tests {
     fn test_rewrite_toml_pipe_rewrites_only_safe_final() {
         assert_eq!(
             rewrite_command_no_prefixes("jj log | grep change", &[]),
-            Some("jj log | rtk grep change".into())
+            Some("jj log | tokenaut grep change".into())
         );
     }
 
@@ -2700,7 +2710,7 @@ mod tests {
     fn test_rewrite_toml_compound() {
         assert_eq!(
             rewrite_command_no_prefixes("jj diff && jq .", &[]),
-            Some("rtk jj diff && rtk jq .".into())
+            Some("tokenaut jj diff && tokenaut jq .".into())
         );
     }
 
@@ -2708,7 +2718,7 @@ mod tests {
     fn test_rewrite_toml_env_prefix() {
         assert_eq!(
             rewrite_command_no_prefixes("FOO=bar jj log", &[]),
-            Some("FOO=bar rtk jj log".into())
+            Some("FOO=bar tokenaut jj log".into())
         );
     }
 
@@ -2736,7 +2746,7 @@ mod tests {
     fn test_rewrite_with_env_prefix() {
         assert_eq!(
             rewrite_command_no_prefixes("GIT_SSH_COMMAND=ssh git push", &[]),
-            Some("GIT_SSH_COMMAND=ssh rtk git push".into())
+            Some("GIT_SSH_COMMAND=ssh tokenaut git push".into())
         );
     }
 
@@ -2762,7 +2772,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command_no_prefixes(&format!("{command} --noEmit"), &[]),
-                Some("rtk tsc --noEmit".into()),
+                Some("tokenaut tsc --noEmit".into()),
                 "Failed for command: {}",
                 command
             );
@@ -2773,7 +2783,7 @@ mod tests {
     fn test_rewrite_cat_file() {
         assert_eq!(
             rewrite_command_no_prefixes("cat src/main.rs", &[]),
-            Some("rtk read src/main.rs".into())
+            Some("tokenaut read src/main.rs".into())
         );
     }
 
@@ -2796,7 +2806,7 @@ mod tests {
         // cat -n (line numbers) maps to rtk read -n — allow rewrite
         assert_eq!(
             rewrite_command_no_prefixes("cat -n file.txt", &[]),
-            Some("rtk read -n file.txt".into())
+            Some("tokenaut read -n file.txt".into())
         );
     }
 
@@ -2804,7 +2814,7 @@ mod tests {
     fn test_rewrite_rg_pattern() {
         assert_eq!(
             rewrite_command_no_prefixes("rg \"fn main\"", &[]),
-            Some("rtk rg \"fn main\"".into())
+            Some("tokenaut rg \"fn main\"".into())
         );
     }
 
@@ -2830,7 +2840,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command_no_prefixes(&format!("{command} test"), &[]),
-                Some("rtk playwright test".into()),
+                Some("tokenaut playwright test".into()),
                 "Failed for command: {}",
                 command
             );
@@ -2859,7 +2869,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command_no_prefixes(&format!("{command} --turbo"), &[]),
-                Some("rtk next --turbo".into()),
+                Some("tokenaut next --turbo".into()),
                 "Failed for command: {}",
                 command
             );
@@ -2870,7 +2880,7 @@ mod tests {
     fn test_rewrite_pipe_final_safe_stage_only() {
         assert_eq!(
             rewrite_command_no_prefixes("git log -10 | grep feat", &[]),
-            Some("git log -10 | rtk grep feat".into())
+            Some("git log -10 | tokenaut grep feat".into())
         );
     }
 
@@ -2938,7 +2948,7 @@ mod tests {
         // find WITHOUT a pipe should still be rewritten
         assert_eq!(
             rewrite_command_no_prefixes("find . -name '*.rs'", &[]),
-            Some("rtk find . -name '*.rs'".into())
+            Some("tokenaut find . -name '*.rs'".into())
         );
     }
 
@@ -2960,8 +2970,8 @@ mod tests {
     fn test_rewrite_mixed_compound_partial() {
         // First segment already RTK, second gets rewritten
         assert_eq!(
-            rewrite_command_no_prefixes("rtk git add . && cargo test", &[]),
-            Some("rtk git add . && rtk cargo test".into())
+            rewrite_command_no_prefixes("tokenaut git add . && cargo test", &[]),
+            Some("tokenaut git add . && tokenaut cargo test".into())
         );
     }
 
@@ -3042,7 +3052,7 @@ mod tests {
     fn test_rewrite_non_rtk_disabled_env_still_rewrites() {
         assert_eq!(
             rewrite_command_no_prefixes("SOME_VAR=1 git status", &[]),
-            Some("SOME_VAR=1 rtk git status".into())
+            Some("SOME_VAR=1 tokenaut git status".into())
         );
     }
 
@@ -3053,7 +3063,7 @@ mod tests {
                 r#"GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git push"#,
                 &[]
             ),
-            Some(r#"GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" rtk git push"#.into())
+            Some(r#"GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" tokenaut git push"#.into())
         );
     }
 
@@ -3061,7 +3071,7 @@ mod tests {
     fn test_rewrite_env_single_quoted_value_with_spaces() {
         assert_eq!(
             rewrite_command_no_prefixes("EDITOR='vim -u NONE' git commit", &[]),
-            Some("EDITOR='vim -u NONE' rtk git commit".into())
+            Some("EDITOR='vim -u NONE' tokenaut git commit".into())
         );
     }
 
@@ -3069,7 +3079,7 @@ mod tests {
     fn test_rewrite_env_quoted_plus_unquoted() {
         assert_eq!(
             rewrite_command_no_prefixes(r#"FOO="bar baz" BAR=1 git status"#, &[]),
-            Some(r#"FOO="bar baz" BAR=1 rtk git status"#.into())
+            Some(r#"FOO="bar baz" BAR=1 tokenaut git status"#.into())
         );
     }
 
@@ -3077,7 +3087,7 @@ mod tests {
     fn test_rewrite_env_escaped_quotes_in_value() {
         assert_eq!(
             rewrite_command_no_prefixes(r#"FOO="he said \"hello\"" git status"#, &[]),
-            Some(r#"FOO="he said \"hello\"" rtk git status"#.into())
+            Some(r#"FOO="he said \"hello\"" tokenaut git status"#.into())
         );
     }
 
@@ -3086,7 +3096,7 @@ mod tests {
         assert_eq!(
             classify_command(r#"GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git push"#),
             Classification::Supported {
-                rtk_equivalent: "rtk git",
+                rtk_equivalent: "tokenaut git",
                 category: "Git",
                 estimated_savings_pct: 70.0,
                 status: RtkStatus::Existing,
@@ -3100,7 +3110,7 @@ mod tests {
     fn test_rewrite_redirect_2_gt_amp_1_with_pipe() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test 2>&1 | grep FAILED", &[]),
-            Some("cargo test 2>&1 | rtk grep FAILED".into())
+            Some("cargo test 2>&1 | tokenaut grep FAILED".into())
         );
     }
 
@@ -3108,7 +3118,7 @@ mod tests {
     fn test_rewrite_redirect_2_gt_amp_1_trailing() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test 2>&1", &[]),
-            Some("rtk cargo test 2>&1".into())
+            Some("tokenaut cargo test 2>&1".into())
         );
     }
 
@@ -3117,7 +3127,7 @@ mod tests {
         // 2>/dev/null has no `&`, never broken — non-regression
         assert_eq!(
             rewrite_command_no_prefixes("git status 2>/dev/null", &[]),
-            Some("rtk git status 2>/dev/null".into())
+            Some("tokenaut git status 2>/dev/null".into())
         );
     }
 
@@ -3125,7 +3135,7 @@ mod tests {
     fn test_rewrite_redirect_2_gt_amp_1_with_and() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test 2>&1 && echo done", &[]),
-            Some("rtk cargo test 2>&1 && echo done".into())
+            Some("tokenaut cargo test 2>&1 && echo done".into())
         );
     }
 
@@ -3133,7 +3143,7 @@ mod tests {
     fn test_rewrite_redirect_amp_gt_devnull() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test &>/dev/null", &[]),
-            Some("rtk cargo test &>/dev/null".into())
+            Some("tokenaut cargo test &>/dev/null".into())
         );
     }
 
@@ -3142,7 +3152,7 @@ mod tests {
         // Double redirect: only last one stripped, but full command rewrites correctly
         assert_eq!(
             rewrite_command_no_prefixes("git status 2>&1 >/dev/null", &[]),
-            Some("rtk git status 2>&1 >/dev/null".into())
+            Some("tokenaut git status 2>&1 >/dev/null".into())
         );
     }
 
@@ -3151,7 +3161,7 @@ mod tests {
         // 2>&- (close stderr fd)
         assert_eq!(
             rewrite_command_no_prefixes("git status 2>&-", &[]),
-            Some("rtk git status 2>&-".into())
+            Some("tokenaut git status 2>&-".into())
         );
     }
 
@@ -3171,7 +3181,7 @@ mod tests {
         // background `&` must still work after redirect fix
         assert_eq!(
             rewrite_command_no_prefixes("cargo test & git status", &[]),
-            Some("rtk cargo test & rtk git status".into())
+            Some("tokenaut cargo test & tokenaut git status".into())
         );
     }
 
@@ -3202,7 +3212,7 @@ mod tests {
         // ...and must not affect unrelated commands.
         assert_eq!(
             rewrite_command_no_prefixes("git status", &excluded),
-            Some("rtk git status".into())
+            Some("tokenaut git status".into())
         );
     }
 
@@ -3223,7 +3233,7 @@ mod tests {
         // A non-excluded inner command still rewrites through the wrapper.
         assert_eq!(
             rewrite_command_no_prefixes("uv run head -20 src/main.rs", &["cat".to_string()]),
-            Some("uv run rtk read src/main.rs --max-lines 20".into())
+            Some("uv run tokenaut read src/main.rs --max-lines 20".into())
         );
     }
 
@@ -3231,7 +3241,7 @@ mod tests {
     fn test_head_tail_rewrite_when_not_excluded() {
         assert_eq!(
             rewrite_command_no_prefixes("head -20 src/main.rs", &["cat".to_string()]),
-            Some("rtk read src/main.rs --max-lines 20".into())
+            Some("tokenaut read src/main.rs --max-lines 20".into())
         );
     }
 
@@ -3240,7 +3250,7 @@ mod tests {
         // head -20 file → rtk read file --max-lines 20 (not rtk read -20 file)
         assert_eq!(
             rewrite_command_no_prefixes("head -20 src/main.rs", &[]),
-            Some("rtk read src/main.rs --max-lines 20".into())
+            Some("tokenaut read src/main.rs --max-lines 20".into())
         );
     }
 
@@ -3248,7 +3258,7 @@ mod tests {
     fn test_rewrite_head_lines_long_flag() {
         assert_eq!(
             rewrite_command_no_prefixes("head --lines=50 src/lib.rs", &[]),
-            Some("rtk read src/lib.rs --max-lines 50".into())
+            Some("tokenaut read src/lib.rs --max-lines 50".into())
         );
     }
 
@@ -3257,7 +3267,7 @@ mod tests {
         // plain `head file` → `rtk read file` (no numeric flag)
         assert_eq!(
             rewrite_command_no_prefixes("head src/main.rs", &[]),
-            Some("rtk read src/main.rs".into())
+            Some("tokenaut read src/main.rs".into())
         );
     }
 
@@ -3274,7 +3284,7 @@ mod tests {
     fn test_rewrite_tail_numeric_flag() {
         assert_eq!(
             rewrite_command_no_prefixes("tail -20 src/main.rs", &[]),
-            Some("rtk read src/main.rs --tail-lines 20".into())
+            Some("tokenaut read src/main.rs --tail-lines 20".into())
         );
     }
 
@@ -3282,7 +3292,7 @@ mod tests {
     fn test_rewrite_tail_n_space_flag() {
         assert_eq!(
             rewrite_command_no_prefixes("tail -n 12 src/lib.rs", &[]),
-            Some("rtk read src/lib.rs --tail-lines 12".into())
+            Some("tokenaut read src/lib.rs --tail-lines 12".into())
         );
     }
 
@@ -3290,7 +3300,7 @@ mod tests {
     fn test_rewrite_tail_lines_long_flag() {
         assert_eq!(
             rewrite_command_no_prefixes("tail --lines=7 src/lib.rs", &[]),
-            Some("rtk read src/lib.rs --tail-lines 7".into())
+            Some("tokenaut read src/lib.rs --tail-lines 7".into())
         );
     }
 
@@ -3298,7 +3308,7 @@ mod tests {
     fn test_rewrite_tail_lines_space_flag() {
         assert_eq!(
             rewrite_command_no_prefixes("tail --lines 7 src/lib.rs", &[]),
-            Some("rtk read src/lib.rs --tail-lines 7".into())
+            Some("tokenaut read src/lib.rs --tail-lines 7".into())
         );
     }
 
@@ -3379,7 +3389,7 @@ mod tests {
         assert!(matches!(
             classify_command("gh release list"),
             Classification::Supported {
-                rtk_equivalent: "rtk gh",
+                rtk_equivalent: "tokenaut gh",
                 ..
             }
         ));
@@ -3390,7 +3400,7 @@ mod tests {
         assert!(matches!(
             classify_command("glab mr list"),
             Classification::Supported {
-                rtk_equivalent: "rtk glab",
+                rtk_equivalent: "tokenaut glab",
                 ..
             }
         ));
@@ -3401,7 +3411,7 @@ mod tests {
         assert!(matches!(
             classify_command("glab ci list"),
             Classification::Supported {
-                rtk_equivalent: "rtk glab",
+                rtk_equivalent: "tokenaut glab",
                 ..
             }
         ));
@@ -3412,7 +3422,7 @@ mod tests {
         assert!(matches!(
             classify_command("glab release list"),
             Classification::Supported {
-                rtk_equivalent: "rtk glab",
+                rtk_equivalent: "tokenaut glab",
                 ..
             }
         ));
@@ -3422,7 +3432,7 @@ mod tests {
     fn test_rewrite_glab_mr_list() {
         assert_eq!(
             rewrite_command_no_prefixes("glab mr list", &[]),
-            Some("rtk glab mr list".into())
+            Some("tokenaut glab mr list".into())
         );
     }
 
@@ -3430,7 +3440,7 @@ mod tests {
     fn test_rewrite_glab_ci_status() {
         assert_eq!(
             rewrite_command_no_prefixes("glab ci status", &[]),
-            Some("rtk glab ci status".into())
+            Some("tokenaut glab ci status".into())
         );
     }
 
@@ -3439,7 +3449,7 @@ mod tests {
         assert!(matches!(
             classify_command("cargo install rtk"),
             Classification::Supported {
-                rtk_equivalent: "rtk cargo",
+                rtk_equivalent: "tokenaut cargo",
                 ..
             }
         ));
@@ -3450,7 +3460,7 @@ mod tests {
         assert!(matches!(
             classify_command("docker run --rm ubuntu bash"),
             Classification::Supported {
-                rtk_equivalent: "rtk docker",
+                rtk_equivalent: "tokenaut docker",
                 ..
             }
         ));
@@ -3461,7 +3471,7 @@ mod tests {
         assert!(matches!(
             classify_command("docker exec -it mycontainer bash"),
             Classification::Supported {
-                rtk_equivalent: "rtk docker",
+                rtk_equivalent: "tokenaut docker",
                 ..
             }
         ));
@@ -3472,7 +3482,7 @@ mod tests {
         assert!(matches!(
             classify_command("docker build -t myimage ."),
             Classification::Supported {
-                rtk_equivalent: "rtk docker",
+                rtk_equivalent: "tokenaut docker",
                 ..
             }
         ));
@@ -3483,7 +3493,7 @@ mod tests {
         assert!(matches!(
             classify_command("kubectl describe pod mypod"),
             Classification::Supported {
-                rtk_equivalent: "rtk kubectl",
+                rtk_equivalent: "tokenaut kubectl",
                 ..
             }
         ));
@@ -3494,7 +3504,7 @@ mod tests {
         assert!(matches!(
             classify_command("kubectl apply -f deploy.yaml"),
             Classification::Supported {
-                rtk_equivalent: "rtk kubectl",
+                rtk_equivalent: "tokenaut kubectl",
                 ..
             }
         ));
@@ -3505,7 +3515,7 @@ mod tests {
         assert!(matches!(
             classify_command("tree src/"),
             Classification::Supported {
-                rtk_equivalent: "rtk tree",
+                rtk_equivalent: "tokenaut tree",
                 ..
             }
         ));
@@ -3516,7 +3526,7 @@ mod tests {
         assert!(matches!(
             classify_command("diff file1.txt file2.txt"),
             Classification::Supported {
-                rtk_equivalent: "rtk diff",
+                rtk_equivalent: "tokenaut diff",
                 ..
             }
         ));
@@ -3526,7 +3536,7 @@ mod tests {
     fn test_rewrite_tree() {
         assert_eq!(
             rewrite_command_no_prefixes("tree src/", &[]),
-            Some("rtk tree src/".into())
+            Some("tokenaut tree src/".into())
         );
     }
 
@@ -3534,7 +3544,7 @@ mod tests {
     fn test_rewrite_diff() {
         assert_eq!(
             rewrite_command_no_prefixes("diff file1.txt file2.txt", &[]),
-            Some("rtk diff file1.txt file2.txt".into())
+            Some("tokenaut diff file1.txt file2.txt".into())
         );
     }
 
@@ -3542,7 +3552,7 @@ mod tests {
     fn test_rewrite_gh_release() {
         assert_eq!(
             rewrite_command_no_prefixes("gh release list", &[]),
-            Some("rtk gh release list".into())
+            Some("tokenaut gh release list".into())
         );
     }
 
@@ -3550,7 +3560,7 @@ mod tests {
     fn test_rewrite_cargo_install() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo install rtk", &[]),
-            Some("rtk cargo install rtk".into())
+            Some("tokenaut cargo install rtk".into())
         );
     }
 
@@ -3558,7 +3568,7 @@ mod tests {
     fn test_rewrite_kubectl_describe() {
         assert_eq!(
             rewrite_command_no_prefixes("kubectl describe pod mypod", &[]),
-            Some("rtk kubectl describe pod mypod".into())
+            Some("tokenaut kubectl describe pod mypod".into())
         );
     }
 
@@ -3566,7 +3576,7 @@ mod tests {
     fn test_rewrite_docker_run() {
         assert_eq!(
             rewrite_command_no_prefixes("docker run --rm ubuntu bash", &[]),
-            Some("rtk docker run --rm ubuntu bash".into())
+            Some("tokenaut docker run --rm ubuntu bash".into())
         );
     }
 
@@ -3574,7 +3584,7 @@ mod tests {
     fn test_rewrite_bun_x_space_form() {
         assert_eq!(
             rewrite_command_no_prefixes("bun x tsc --noEmit", &[]),
-            Some("rtk bun x tsc --noEmit".into())
+            Some("tokenaut bun x tsc --noEmit".into())
         );
     }
 
@@ -3598,7 +3608,7 @@ mod tests {
         assert_eq!(rewrite_command_no_prefixes("deno testify", &[]), None);
         assert_eq!(
             rewrite_command_no_prefixes("deno task build", &[]),
-            Some("rtk deno task build".into())
+            Some("tokenaut deno task build".into())
         );
     }
 
@@ -3642,7 +3652,7 @@ mod tests {
         assert!(matches!(
             classify_command("swift test"),
             Classification::Supported {
-                rtk_equivalent: "rtk swift",
+                rtk_equivalent: "tokenaut swift",
                 category: "Build",
                 estimated_savings_pct: 90.0,
                 status: RtkStatus::Existing,
@@ -3654,7 +3664,7 @@ mod tests {
     fn test_rewrite_swift_test() {
         assert_eq!(
             rewrite_command_no_prefixes("swift test --parallel", &[]),
-            Some("rtk swift test --parallel".into())
+            Some("tokenaut swift test --parallel".into())
         );
     }
 
@@ -3664,7 +3674,7 @@ mod tests {
     fn test_rewrite_docker_compose_ps() {
         assert_eq!(
             rewrite_command_no_prefixes("docker compose ps", &[]),
-            Some("rtk docker compose ps".into())
+            Some("tokenaut docker compose ps".into())
         );
     }
 
@@ -3672,7 +3682,7 @@ mod tests {
     fn test_rewrite_docker_compose_logs() {
         assert_eq!(
             rewrite_command_no_prefixes("docker compose logs web", &[]),
-            Some("rtk docker compose logs web".into())
+            Some("tokenaut docker compose logs web".into())
         );
     }
 
@@ -3680,7 +3690,7 @@ mod tests {
     fn test_rewrite_docker_compose_build() {
         assert_eq!(
             rewrite_command_no_prefixes("docker compose build", &[]),
-            Some("rtk docker compose build".into())
+            Some("tokenaut docker compose build".into())
         );
     }
 
@@ -3715,7 +3725,7 @@ mod tests {
         assert!(matches!(
             classify_command("aws s3 ls"),
             Classification::Supported {
-                rtk_equivalent: "rtk aws",
+                rtk_equivalent: "tokenaut aws",
                 ..
             }
         ));
@@ -3726,7 +3736,7 @@ mod tests {
         assert!(matches!(
             classify_command("aws ec2 describe-instances"),
             Classification::Supported {
-                rtk_equivalent: "rtk aws",
+                rtk_equivalent: "tokenaut aws",
                 ..
             }
         ));
@@ -3737,7 +3747,7 @@ mod tests {
         assert!(matches!(
             classify_command("psql -U postgres"),
             Classification::Supported {
-                rtk_equivalent: "rtk psql",
+                rtk_equivalent: "tokenaut psql",
                 ..
             }
         ));
@@ -3748,7 +3758,7 @@ mod tests {
         assert!(matches!(
             classify_command("psql postgres://localhost/mydb"),
             Classification::Supported {
-                rtk_equivalent: "rtk psql",
+                rtk_equivalent: "tokenaut psql",
                 ..
             }
         ));
@@ -3758,7 +3768,7 @@ mod tests {
     fn test_rewrite_aws() {
         assert_eq!(
             rewrite_command_no_prefixes("aws s3 ls", &[]),
-            Some("rtk aws s3 ls".into())
+            Some("tokenaut aws s3 ls".into())
         );
     }
 
@@ -3766,7 +3776,7 @@ mod tests {
     fn test_rewrite_aws_ec2() {
         assert_eq!(
             rewrite_command_no_prefixes("aws ec2 describe-instances --region us-east-1", &[]),
-            Some("rtk aws ec2 describe-instances --region us-east-1".into())
+            Some("tokenaut aws ec2 describe-instances --region us-east-1".into())
         );
     }
 
@@ -3774,7 +3784,7 @@ mod tests {
     fn test_rewrite_psql() {
         assert_eq!(
             rewrite_command_no_prefixes("psql -U postgres -d mydb", &[]),
-            Some("rtk psql -U postgres -d mydb".into())
+            Some("tokenaut psql -U postgres -d mydb".into())
         );
     }
 
@@ -3785,7 +3795,7 @@ mod tests {
         assert!(matches!(
             classify_command("ruff check ."),
             Classification::Supported {
-                rtk_equivalent: "rtk ruff",
+                rtk_equivalent: "tokenaut ruff",
                 ..
             }
         ));
@@ -3796,7 +3806,7 @@ mod tests {
         assert!(matches!(
             classify_command("ruff format src/"),
             Classification::Supported {
-                rtk_equivalent: "rtk ruff",
+                rtk_equivalent: "tokenaut ruff",
                 ..
             }
         ));
@@ -3807,7 +3817,7 @@ mod tests {
         assert!(matches!(
             classify_command("pytest tests/"),
             Classification::Supported {
-                rtk_equivalent: "rtk pytest",
+                rtk_equivalent: "tokenaut pytest",
                 ..
             }
         ));
@@ -3818,7 +3828,7 @@ mod tests {
         assert!(matches!(
             classify_command("python -m pytest tests/"),
             Classification::Supported {
-                rtk_equivalent: "rtk pytest",
+                rtk_equivalent: "tokenaut pytest",
                 ..
             }
         ));
@@ -3829,7 +3839,7 @@ mod tests {
         assert!(matches!(
             classify_command("pip list"),
             Classification::Supported {
-                rtk_equivalent: "rtk pip",
+                rtk_equivalent: "tokenaut pip",
                 ..
             }
         ));
@@ -3840,7 +3850,7 @@ mod tests {
         assert!(matches!(
             classify_command("uv pip list"),
             Classification::Supported {
-                rtk_equivalent: "rtk pip",
+                rtk_equivalent: "tokenaut pip",
                 ..
             }
         ));
@@ -3850,7 +3860,7 @@ mod tests {
     fn test_rewrite_ruff_check() {
         assert_eq!(
             rewrite_command_no_prefixes("ruff check .", &[]),
-            Some("rtk ruff check .".into())
+            Some("tokenaut ruff check .".into())
         );
     }
 
@@ -3858,7 +3868,7 @@ mod tests {
     fn test_rewrite_ruff_format() {
         assert_eq!(
             rewrite_command_no_prefixes("ruff format src/", &[]),
-            Some("rtk ruff format src/".into())
+            Some("tokenaut ruff format src/".into())
         );
     }
 
@@ -3866,7 +3876,7 @@ mod tests {
     fn test_rewrite_pytest() {
         assert_eq!(
             rewrite_command_no_prefixes("pytest tests/", &[]),
-            Some("rtk pytest tests/".into())
+            Some("tokenaut pytest tests/".into())
         );
     }
 
@@ -3874,7 +3884,7 @@ mod tests {
     fn test_rewrite_python_m_pytest() {
         assert_eq!(
             rewrite_command_no_prefixes("python -m pytest -x tests/", &[]),
-            Some("rtk pytest -x tests/".into())
+            Some("tokenaut pytest -x tests/".into())
         );
     }
 
@@ -3882,7 +3892,7 @@ mod tests {
     fn test_rewrite_uv_run_pytest() {
         assert_eq!(
             rewrite_command_no_prefixes("uv run pytest tests/", &[]),
-            Some("uv run rtk pytest tests/".into())
+            Some("uv run tokenaut pytest tests/".into())
         );
     }
 
@@ -3890,7 +3900,7 @@ mod tests {
     fn test_rewrite_env_uv_run_pytest() {
         assert_eq!(
             rewrite_command_no_prefixes("PYTHONPATH=. uv run pytest tests/", &[]),
-            Some("PYTHONPATH=. uv run rtk pytest tests/".into())
+            Some("PYTHONPATH=. uv run tokenaut pytest tests/".into())
         );
     }
 
@@ -3898,7 +3908,7 @@ mod tests {
     fn test_rewrite_uv_run_python_m_pytest() {
         assert_eq!(
             rewrite_command_no_prefixes("uv run python -m pytest -q", &[]),
-            Some("uv run rtk pytest -q".into())
+            Some("uv run tokenaut pytest -q".into())
         );
     }
 
@@ -3906,7 +3916,7 @@ mod tests {
     fn test_rewrite_uv_run_supported_inner_command() {
         assert_eq!(
             rewrite_command_no_prefixes("uv run ruff check .", &[]),
-            Some("uv run rtk ruff check .".into())
+            Some("uv run tokenaut ruff check .".into())
         );
     }
 
@@ -3914,15 +3924,15 @@ mod tests {
     fn test_rewrite_uv_run_options_are_passed_through() {
         assert_eq!(
             rewrite_command_no_prefixes("uv run --unknown pytest tests/", &[]),
-            Some("rtk uv run --unknown pytest tests/".into())
+            Some("tokenaut uv run --unknown pytest tests/".into())
         );
         assert_eq!(
             rewrite_command_no_prefixes("uv run -m pytest -q", &[]),
-            Some("rtk uv run -m pytest -q".into())
+            Some("tokenaut uv run -m pytest -q".into())
         );
         assert_eq!(
             rewrite_command_no_prefixes("uv run --module pytest -q", &[]),
-            Some("rtk uv run --module pytest -q".into())
+            Some("tokenaut uv run --module pytest -q".into())
         );
     }
 
@@ -3930,7 +3940,7 @@ mod tests {
     fn test_rewrite_pip_list() {
         assert_eq!(
             rewrite_command_no_prefixes("pip list", &[]),
-            Some("rtk pip list".into())
+            Some("tokenaut pip list".into())
         );
     }
 
@@ -3938,7 +3948,7 @@ mod tests {
     fn test_rewrite_pip_outdated() {
         assert_eq!(
             rewrite_command_no_prefixes("pip outdated", &[]),
-            Some("rtk pip outdated".into())
+            Some("tokenaut pip outdated".into())
         );
     }
 
@@ -3946,7 +3956,7 @@ mod tests {
     fn test_rewrite_uv_pip_list() {
         assert_eq!(
             rewrite_command_no_prefixes("uv pip list", &[]),
-            Some("rtk pip list".into())
+            Some("tokenaut pip list".into())
         );
     }
 
@@ -3964,7 +3974,7 @@ mod tests {
                 matches!(
                     classify_command(command),
                     Classification::Supported {
-                        rtk_equivalent: "rtk uv",
+                        rtk_equivalent: "tokenaut uv",
                         ..
                     }
                 ),
@@ -3997,12 +4007,15 @@ mod tests {
     #[test]
     fn test_rewrite_uv_run() {
         let cases = vec![
-            ("uv run pytest", "uv run rtk pytest"),
-            ("uv run ruff check", "uv run rtk ruff check"),
-            ("uv run python script.py", "rtk uv run python script.py"),
+            ("uv run pytest", "uv run tokenaut pytest"),
+            ("uv run ruff check", "uv run tokenaut ruff check"),
+            (
+                "uv run python script.py",
+                "tokenaut uv run python script.py",
+            ),
             (
                 "uv run --project backend --extra dev python script.py",
-                "rtk uv run --project backend --extra dev python script.py",
+                "tokenaut uv run --project backend --extra dev python script.py",
             ),
         ];
 
@@ -4023,7 +4036,7 @@ mod tests {
         assert!(matches!(
             classify_command("go test ./..."),
             Classification::Supported {
-                rtk_equivalent: "rtk go",
+                rtk_equivalent: "tokenaut go",
                 ..
             }
         ));
@@ -4034,7 +4047,7 @@ mod tests {
         assert!(matches!(
             classify_command("go build ./..."),
             Classification::Supported {
-                rtk_equivalent: "rtk go",
+                rtk_equivalent: "tokenaut go",
                 ..
             }
         ));
@@ -4045,7 +4058,7 @@ mod tests {
         assert!(matches!(
             classify_command("go vet ./..."),
             Classification::Supported {
-                rtk_equivalent: "rtk go",
+                rtk_equivalent: "tokenaut go",
                 ..
             }
         ));
@@ -4056,7 +4069,7 @@ mod tests {
         assert!(matches!(
             classify_command("golangci-lint run"),
             Classification::Supported {
-                rtk_equivalent: "rtk golangci-lint run",
+                rtk_equivalent: "tokenaut golangci-lint run",
                 ..
             }
         ));
@@ -4067,7 +4080,7 @@ mod tests {
         assert!(matches!(
             classify_command("golangci-lint -v run ./..."),
             Classification::Supported {
-                rtk_equivalent: "rtk golangci-lint run",
+                rtk_equivalent: "tokenaut golangci-lint run",
                 ..
             }
         ));
@@ -4078,7 +4091,7 @@ mod tests {
         assert!(matches!(
             classify_command("golangci-lint --color never run ./..."),
             Classification::Supported {
-                rtk_equivalent: "rtk golangci-lint run",
+                rtk_equivalent: "tokenaut golangci-lint run",
                 ..
             }
         ));
@@ -4089,7 +4102,7 @@ mod tests {
         assert!(matches!(
             classify_command("golangci-lint --color=never run ./..."),
             Classification::Supported {
-                rtk_equivalent: "rtk golangci-lint run",
+                rtk_equivalent: "tokenaut golangci-lint run",
                 ..
             }
         ));
@@ -4100,7 +4113,7 @@ mod tests {
         assert!(matches!(
             classify_command("golangci-lint --config=foo.yml run ./..."),
             Classification::Supported {
-                rtk_equivalent: "rtk golangci-lint run",
+                rtk_equivalent: "tokenaut golangci-lint run",
                 ..
             }
         ));
@@ -4111,7 +4124,7 @@ mod tests {
         assert!(!matches!(
             classify_command("golangci-lint"),
             Classification::Supported {
-                rtk_equivalent: "rtk golangci-lint run",
+                rtk_equivalent: "tokenaut golangci-lint run",
                 ..
             }
         ));
@@ -4122,7 +4135,7 @@ mod tests {
         assert!(!matches!(
             classify_command("golangci-lint version"),
             Classification::Supported {
-                rtk_equivalent: "rtk golangci-lint run",
+                rtk_equivalent: "tokenaut golangci-lint run",
                 ..
             }
         ));
@@ -4132,7 +4145,7 @@ mod tests {
     fn test_rewrite_go_test() {
         assert_eq!(
             rewrite_command_no_prefixes("go test ./...", &[]),
-            Some("rtk go test ./...".into())
+            Some("tokenaut go test ./...".into())
         );
     }
 
@@ -4140,7 +4153,7 @@ mod tests {
     fn test_rewrite_go_build() {
         assert_eq!(
             rewrite_command_no_prefixes("go build ./...", &[]),
-            Some("rtk go build ./...".into())
+            Some("tokenaut go build ./...".into())
         );
     }
 
@@ -4148,7 +4161,7 @@ mod tests {
     fn test_rewrite_go_vet() {
         assert_eq!(
             rewrite_command_no_prefixes("go vet ./...", &[]),
-            Some("rtk go vet ./...".into())
+            Some("tokenaut go vet ./...".into())
         );
     }
 
@@ -4156,7 +4169,7 @@ mod tests {
     fn test_rewrite_golangci_lint() {
         assert_eq!(
             rewrite_command_no_prefixes("golangci-lint run ./...", &[]),
-            Some("rtk golangci-lint run ./...".into())
+            Some("tokenaut golangci-lint run ./...".into())
         );
     }
 
@@ -4164,7 +4177,7 @@ mod tests {
     fn test_rewrite_golangci_lint_with_flag_before_run() {
         assert_eq!(
             rewrite_command_no_prefixes("golangci-lint -v run ./...", &[]),
-            Some("rtk golangci-lint -v run ./...".into())
+            Some("tokenaut golangci-lint -v run ./...".into())
         );
     }
 
@@ -4172,7 +4185,7 @@ mod tests {
     fn test_rewrite_golangci_lint_with_value_flag_before_run() {
         assert_eq!(
             rewrite_command_no_prefixes("golangci-lint --color never run ./...", &[]),
-            Some("rtk golangci-lint --color never run ./...".into())
+            Some("tokenaut golangci-lint --color never run ./...".into())
         );
     }
 
@@ -4180,7 +4193,7 @@ mod tests {
     fn test_rewrite_golangci_lint_with_inline_value_flag_before_run() {
         assert_eq!(
             rewrite_command_no_prefixes("golangci-lint --color=never run ./...", &[]),
-            Some("rtk golangci-lint --color=never run ./...".into())
+            Some("tokenaut golangci-lint --color=never run ./...".into())
         );
     }
 
@@ -4188,7 +4201,7 @@ mod tests {
     fn test_rewrite_golangci_lint_with_inline_config_flag_before_run() {
         assert_eq!(
             rewrite_command_no_prefixes("golangci-lint --config=foo.yml run ./...", &[]),
-            Some("rtk golangci-lint --config=foo.yml run ./...".into())
+            Some("tokenaut golangci-lint --config=foo.yml run ./...".into())
         );
     }
 
@@ -4196,7 +4209,7 @@ mod tests {
     fn test_rewrite_env_prefixed_golangci_lint_with_value_flag_before_run() {
         assert_eq!(
             rewrite_command_no_prefixes("FOO=1 golangci-lint --color never run ./...", &[]),
-            Some("FOO=1 rtk golangci-lint --color never run ./...".into())
+            Some("FOO=1 tokenaut golangci-lint --color never run ./...".into())
         );
     }
 
@@ -4204,7 +4217,7 @@ mod tests {
     fn test_rewrite_env_prefixed_golangci_lint_with_inline_value_flag_before_run() {
         assert_eq!(
             rewrite_command_no_prefixes("FOO=1 golangci-lint --color=never run ./...", &[]),
-            Some("FOO=1 rtk golangci-lint --color=never run ./...".into())
+            Some("FOO=1 tokenaut golangci-lint --color=never run ./...".into())
         );
     }
 
@@ -4273,7 +4286,7 @@ mod tests {
                 matches!(
                     classify_command(command),
                     Classification::Supported {
-                        rtk_equivalent: "rtk lint",
+                        rtk_equivalent: "tokenaut lint",
                         ..
                     }
                 ),
@@ -4331,7 +4344,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command_no_prefixes(command, &[]),
-                Some("rtk lint".into()),
+                Some("tokenaut lint".into()),
                 "Failed for command: {}",
                 command
             );
@@ -4377,7 +4390,7 @@ mod tests {
                 matches!(
                     classify_command(command),
                     Classification::Supported {
-                        rtk_equivalent: "rtk jest",
+                        rtk_equivalent: "tokenaut jest",
                         ..
                     }
                 ),
@@ -4424,7 +4437,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command_no_prefixes(command, &[]),
-                Some("rtk jest".into()),
+                Some("tokenaut jest".into()),
                 "Failed for command: {}",
                 command
             );
@@ -4470,7 +4483,7 @@ mod tests {
                 matches!(
                     classify_command(command),
                     Classification::Supported {
-                        rtk_equivalent: "rtk vitest",
+                        rtk_equivalent: "tokenaut vitest",
                         ..
                     }
                 ),
@@ -4517,7 +4530,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command_no_prefixes(command, &[]),
-                Some("rtk vitest".into()),
+                Some("tokenaut vitest".into()),
                 "Failed for command: {}",
                 command
             );
@@ -4548,7 +4561,7 @@ mod tests {
                 matches!(
                     classify_command(format!("{command} migrate dev").as_str()),
                     Classification::Supported {
-                        rtk_equivalent: "rtk prisma",
+                        rtk_equivalent: "tokenaut prisma",
                         ..
                     }
                 ),
@@ -4580,7 +4593,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command_no_prefixes(format!("{command} migrate dev").as_str(), &[]),
-                Some("rtk prisma migrate dev".into()),
+                Some("tokenaut prisma migrate dev".into()),
                 "Failed for command: {}",
                 command
             );
@@ -4609,7 +4622,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command_no_prefixes(format!("{command} --check src/").as_str(), &[]),
-                Some("rtk prettier --check src/".into()),
+                Some("tokenaut prettier --check src/".into()),
                 "Failed for command: {}",
                 command
             );
@@ -4631,7 +4644,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command_no_prefixes(format!("pnpm {command}").as_str(), &[]),
-                Some(format!("rtk pnpm {command}")),
+                Some(format!("tokenaut pnpm {command}")),
                 "Failed for command: pnpm {}",
                 command
             );
@@ -4644,7 +4657,7 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command_no_prefixes(format!("npm {command}").as_str(), &[]),
-                Some(format!("rtk npm {command}")),
+                Some(format!("tokenaut npm {command}")),
                 "Failed for bare command: npm {}",
                 command
             );
@@ -4655,11 +4668,11 @@ mod tests {
     fn test_rewrite_npm_with_args() {
         assert_eq!(
             rewrite_command_no_prefixes("npm run test", &[]),
-            Some("rtk npm run test".to_string()),
+            Some("tokenaut npm run test".to_string()),
         );
         assert_eq!(
             rewrite_command_no_prefixes("npm exec vitest", &[]),
-            Some("rtk vitest".to_string()),
+            Some("tokenaut vitest".to_string()),
         );
     }
 
@@ -4667,7 +4680,7 @@ mod tests {
     fn test_rewrite_npx() {
         assert_eq!(
             rewrite_command_no_prefixes("npx svgo", &[]),
-            Some("rtk npx svgo".to_string()),
+            Some("tokenaut npx svgo".to_string()),
         );
     }
 
@@ -4678,7 +4691,7 @@ mod tests {
         assert!(matches!(
             classify_command("./gradlew assembleDebug"),
             Classification::Supported {
-                rtk_equivalent: "rtk gradlew",
+                rtk_equivalent: "tokenaut gradlew",
                 ..
             }
         ));
@@ -4689,7 +4702,7 @@ mod tests {
         assert!(matches!(
             classify_command("gradlew build"),
             Classification::Supported {
-                rtk_equivalent: "rtk gradlew",
+                rtk_equivalent: "tokenaut gradlew",
                 ..
             }
         ));
@@ -4700,7 +4713,7 @@ mod tests {
         assert!(matches!(
             classify_command("gradlew.bat clean"),
             Classification::Supported {
-                rtk_equivalent: "rtk gradlew",
+                rtk_equivalent: "tokenaut gradlew",
                 ..
             }
         ));
@@ -4711,7 +4724,7 @@ mod tests {
         assert!(matches!(
             classify_command("gradle build"),
             Classification::Supported {
-                rtk_equivalent: "rtk gradlew",
+                rtk_equivalent: "tokenaut gradlew",
                 ..
             }
         ));
@@ -4721,7 +4734,7 @@ mod tests {
     fn test_rewrite_gradlew() {
         assert_eq!(
             rewrite_command_no_prefixes("./gradlew assembleDebug", &[]),
-            Some("rtk gradlew assembleDebug".into())
+            Some("tokenaut gradlew assembleDebug".into())
         );
     }
 
@@ -4729,7 +4742,7 @@ mod tests {
     fn test_rewrite_gradlew_no_dot_slash() {
         assert_eq!(
             rewrite_command_no_prefixes("gradlew build", &[]),
-            Some("rtk gradlew build".into())
+            Some("tokenaut gradlew build".into())
         );
     }
 
@@ -4737,7 +4750,7 @@ mod tests {
     fn test_rewrite_gradlew_bat() {
         assert_eq!(
             rewrite_command_no_prefixes("gradlew.bat clean", &[]),
-            Some("rtk gradlew clean".into())
+            Some("tokenaut gradlew clean".into())
         );
     }
 
@@ -4745,7 +4758,7 @@ mod tests {
     fn test_rewrite_gradle() {
         assert_eq!(
             rewrite_command_no_prefixes("gradle build", &[]),
-            Some("rtk gradlew build".into())
+            Some("tokenaut gradlew build".into())
         );
     }
 
@@ -4754,7 +4767,7 @@ mod tests {
         assert_eq!(
             classify_command("./gradlew test"),
             Classification::Supported {
-                rtk_equivalent: "rtk gradlew",
+                rtk_equivalent: "tokenaut gradlew",
                 category: "Build",
                 estimated_savings_pct: 90.0,
                 status: RtkStatus::Existing,
@@ -4766,19 +4779,19 @@ mod tests {
     fn test_rewrite_sbt_test_only() {
         assert_eq!(
             rewrite_command_no_prefixes("sbt testOnly com.example.MySpec", &[]),
-            Some("rtk sbt testOnly com.example.MySpec".into())
+            Some("tokenaut sbt testOnly com.example.MySpec".into())
         );
         assert_eq!(
             rewrite_command_no_prefixes(r#"sbt "testOnly com.example.MySpec""#, &[]),
-            Some(r#"rtk sbt "testOnly com.example.MySpec""#.into())
+            Some(r#"tokenaut sbt "testOnly com.example.MySpec""#.into())
         );
         assert_eq!(
             rewrite_command_no_prefixes(r#"sbt "testOnly *MySpec -- -z foo""#, &[]),
-            Some(r#"rtk sbt "testOnly *MySpec -- -z foo""#.into())
+            Some(r#"tokenaut sbt "testOnly *MySpec -- -z foo""#.into())
         );
         assert_eq!(
             rewrite_command_no_prefixes("sbt testQuick", &[]),
-            Some("rtk sbt testQuick".into())
+            Some("tokenaut sbt testQuick".into())
         );
     }
 
@@ -4798,7 +4811,7 @@ mod tests {
         assert!(matches!(
             classify_command("mvn test"),
             Classification::Supported {
-                rtk_equivalent: "rtk mvn",
+                rtk_equivalent: "tokenaut mvn",
                 ..
             }
         ));
@@ -4809,7 +4822,7 @@ mod tests {
         assert!(matches!(
             classify_command("mvn integration-test"),
             Classification::Supported {
-                rtk_equivalent: "rtk mvn",
+                rtk_equivalent: "tokenaut mvn",
                 ..
             }
         ));
@@ -4820,7 +4833,7 @@ mod tests {
         assert!(matches!(
             classify_command("mvn -B -DskipTests=false clean install"),
             Classification::Supported {
-                rtk_equivalent: "rtk mvn",
+                rtk_equivalent: "tokenaut mvn",
                 ..
             }
         ));
@@ -4831,7 +4844,7 @@ mod tests {
         assert!(matches!(
             classify_command("./mvnw verify"),
             Classification::Supported {
-                rtk_equivalent: "rtk mvn",
+                rtk_equivalent: "tokenaut mvn",
                 ..
             }
         ));
@@ -4842,7 +4855,7 @@ mod tests {
         assert!(matches!(
             classify_command("mvnw.cmd package"),
             Classification::Supported {
-                rtk_equivalent: "rtk mvn",
+                rtk_equivalent: "tokenaut mvn",
                 ..
             }
         ));
@@ -4854,7 +4867,7 @@ mod tests {
         assert!(!matches!(
             classify_command("mvn clean"),
             Classification::Supported {
-                rtk_equivalent: "rtk mvn",
+                rtk_equivalent: "tokenaut mvn",
                 ..
             }
         ));
@@ -4865,7 +4878,7 @@ mod tests {
         assert!(!matches!(
             classify_command("mvn site"),
             Classification::Supported {
-                rtk_equivalent: "rtk mvn",
+                rtk_equivalent: "tokenaut mvn",
                 ..
             }
         ));
@@ -4876,7 +4889,7 @@ mod tests {
         assert!(!matches!(
             classify_command("mvn dependency:tree"),
             Classification::Supported {
-                rtk_equivalent: "rtk mvn",
+                rtk_equivalent: "tokenaut mvn",
                 ..
             }
         ));
@@ -4887,7 +4900,7 @@ mod tests {
         assert!(!matches!(
             classify_command("mvn"),
             Classification::Supported {
-                rtk_equivalent: "rtk mvn",
+                rtk_equivalent: "tokenaut mvn",
                 ..
             }
         ));
@@ -4898,7 +4911,7 @@ mod tests {
         assert!(!matches!(
             classify_command("mvn --version"),
             Classification::Supported {
-                rtk_equivalent: "rtk mvn",
+                rtk_equivalent: "tokenaut mvn",
                 ..
             }
         ));
@@ -4908,7 +4921,7 @@ mod tests {
     fn test_rewrite_mvn_clean_install() {
         assert_eq!(
             rewrite_command_no_prefixes("mvn -B clean install", &[]),
-            Some("rtk mvn -B clean install".into())
+            Some("tokenaut mvn -B clean install".into())
         );
     }
 
@@ -4916,7 +4929,7 @@ mod tests {
     fn test_rewrite_mvnw_test() {
         assert_eq!(
             rewrite_command_no_prefixes("./mvnw test", &[]),
-            Some("rtk mvn test".into())
+            Some("tokenaut mvn test".into())
         );
     }
 
@@ -4926,7 +4939,7 @@ mod tests {
     fn test_rewrite_mvnd_clean_install() {
         assert_eq!(
             rewrite_command_no_prefixes("mvnd clean install", &[]),
-            Some("rtk mvnd clean install".into())
+            Some("tokenaut mvnd clean install".into())
         );
     }
 
@@ -4935,7 +4948,7 @@ mod tests {
         assert!(matches!(
             classify_command("mvnd test"),
             Classification::Supported {
-                rtk_equivalent: "rtk mvnd",
+                rtk_equivalent: "tokenaut mvnd",
                 ..
             }
         ));
@@ -4951,7 +4964,7 @@ mod tests {
         assert!(matches!(
             classify_command("mvnd.cmd package"),
             Classification::Supported {
-                rtk_equivalent: "rtk mvnd",
+                rtk_equivalent: "tokenaut mvnd",
                 ..
             }
         ));
@@ -4961,7 +4974,7 @@ mod tests {
     fn test_rewrite_mvnd_cmd_clean_install() {
         assert_eq!(
             rewrite_command_no_prefixes("mvnd.cmd clean install", &[]),
-            Some("rtk mvnd clean install".into())
+            Some("tokenaut mvnd clean install".into())
         );
     }
 
@@ -4972,7 +4985,7 @@ mod tests {
         // `||` fallback: left rewritten, right rewritten
         assert_eq!(
             rewrite_command_no_prefixes("cargo test || cargo build", &[]),
-            Some("rtk cargo test || rtk cargo build".into())
+            Some("tokenaut cargo test || tokenaut cargo build".into())
         );
     }
 
@@ -4980,7 +4993,7 @@ mod tests {
     fn test_rewrite_compound_semicolon() {
         assert_eq!(
             rewrite_command_no_prefixes("git status; cargo test", &[]),
-            Some("rtk git status; rtk cargo test".into())
+            Some("tokenaut git status; tokenaut cargo test".into())
         );
     }
 
@@ -4989,7 +5002,7 @@ mod tests {
         // Producers stay raw; only a pipeline-safe final stage is rewritten.
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | grep FAILED", &[]),
-            Some("cargo test | rtk grep FAILED".into())
+            Some("cargo test | tokenaut grep FAILED".into())
         );
     }
 
@@ -4997,7 +5010,7 @@ mod tests {
     fn test_rewrite_compound_pipe_git_grep() {
         assert_eq!(
             rewrite_command_no_prefixes("git log -10 | grep feat", &[]),
-            Some("git log -10 | rtk grep feat".into())
+            Some("git log -10 | tokenaut grep feat".into())
         );
     }
 
@@ -5012,7 +5025,7 @@ mod tests {
         fn test_rewrite_producer_before_head() {
             assert_eq!(
                 rewrite_command_no_prefixes("grep -n foo x | head -5", &[]),
-                Some("rtk grep -n foo x | head -5".into())
+                Some("tokenaut grep -n foo x | head -5".into())
             );
         }
 
@@ -5020,7 +5033,7 @@ mod tests {
         fn test_rewrite_producer_before_head_keeps_cat_read() {
             assert_eq!(
                 rewrite_command_no_prefixes("cat -n /tmp/x | head -50", &[]),
-                Some("rtk read -n /tmp/x | head -50".into())
+                Some("tokenaut read -n /tmp/x | head -50".into())
             );
         }
 
@@ -5030,11 +5043,11 @@ mod tests {
             // of the RTK view answer the same question `| tail -50` asked.
             assert_eq!(
                 rewrite_command_no_prefixes("cargo test | tail -50", &[]),
-                Some("rtk cargo test | tail -50".into())
+                Some("tokenaut cargo test | tail -50".into())
             );
             assert_eq!(
                 rewrite_command_no_prefixes("npx jest x.test.ts 2>&1 | tail -30", &[]),
-                Some("rtk jest x.test.ts 2>&1 | tail -30".into())
+                Some("tokenaut jest x.test.ts 2>&1 | tail -30".into())
             );
         }
 
@@ -5092,7 +5105,7 @@ mod tests {
             // belongs to the pattern, so the producer is the whole `grep` call.
             assert_eq!(
                 rewrite_command_no_prefixes("grep -n 'a | b' x | head -1", &[]),
-                Some("rtk grep -n 'a | b' x | head -1".into())
+                Some("tokenaut grep -n 'a | b' x | head -1".into())
             );
         }
     }
@@ -5105,7 +5118,7 @@ mod tests {
                 &[]
             ),
             Some(
-                "rtk cargo fmt --all && rtk cargo clippy && rtk cargo test && rtk git status"
+                "tokenaut cargo fmt --all && tokenaut cargo clippy && tokenaut cargo test && tokenaut git status"
                     .into()
             )
         );
@@ -5116,7 +5129,7 @@ mod tests {
         // unsupported segments stay raw
         assert_eq!(
             rewrite_command_no_prefixes("cargo test && htop", &[]),
-            Some("rtk cargo test && htop".into())
+            Some("tokenaut cargo test && htop".into())
         );
     }
 
@@ -5132,7 +5145,7 @@ mod tests {
     fn test_rewrite_sudo_docker() {
         assert_eq!(
             rewrite_command_no_prefixes("sudo docker ps", &[]),
-            Some("sudo rtk docker ps".into())
+            Some("sudo tokenaut docker ps".into())
         );
     }
 
@@ -5140,7 +5153,7 @@ mod tests {
     fn test_rewrite_env_var_prefix() {
         assert_eq!(
             rewrite_command_no_prefixes("GIT_SSH_COMMAND=ssh git push origin main", &[]),
-            Some("GIT_SSH_COMMAND=ssh rtk git push origin main".into())
+            Some("GIT_SSH_COMMAND=ssh tokenaut git push origin main".into())
         );
     }
 
@@ -5150,7 +5163,7 @@ mod tests {
     fn test_rewrite_find_with_flags() {
         assert_eq!(
             rewrite_command_no_prefixes("find . -name '*.rs' -type f", &[]),
-            Some("rtk find . -name '*.rs' -type f".into())
+            Some("tokenaut find . -name '*.rs' -type f".into())
         );
     }
 
@@ -5164,8 +5177,8 @@ mod tests {
             );
             assert!(!rule.rtk_cmd.is_empty(), "Rule with empty rtk_cmd found");
             assert!(
-                rule.rtk_cmd.starts_with("rtk "),
-                "rtk_cmd '{}' must start with 'rtk '",
+                rule.rtk_cmd.starts_with("tokenaut "),
+                "rtk_cmd '{}' must start with 'tokenaut '",
                 rule.rtk_cmd
             );
             assert!(
@@ -5192,7 +5205,7 @@ mod tests {
         let excluded = vec!["curl".to_string()];
         assert_eq!(
             rewrite_command_no_prefixes("git status", &excluded),
-            Some("rtk git status".into())
+            Some("tokenaut git status".into())
         );
     }
 
@@ -5208,7 +5221,7 @@ mod tests {
         let excluded = vec!["curl".to_string()];
         assert_eq!(
             rewrite_command_no_prefixes("git status && curl https://api.example.com", &excluded),
-            Some("rtk git status && curl https://api.example.com".into())
+            Some("tokenaut git status && curl https://api.example.com".into())
         );
     }
 
@@ -5382,7 +5395,7 @@ mod tests {
         );
         assert_eq!(
             rewrite_command_no_prefixes("git status", &excluded),
-            Some("rtk git status".into())
+            Some("tokenaut git status".into())
         );
     }
 
@@ -5461,7 +5474,7 @@ mod tests {
     fn test_rewrite_gh_without_json_still_works() {
         assert_eq!(
             rewrite_command_no_prefixes("gh pr list", &[]),
-            Some("rtk gh pr list".into())
+            Some("tokenaut gh pr list".into())
         );
     }
 
@@ -5477,7 +5490,7 @@ mod tests {
             "RTK_DISABLED=true git log --oneline"
         ));
         assert!(!cmd_has_rtk_disabled_prefix("git status"));
-        assert!(!cmd_has_rtk_disabled_prefix("rtk git status"));
+        assert!(!cmd_has_rtk_disabled_prefix("tokenaut git status"));
         assert!(!cmd_has_rtk_disabled_prefix("SOME_VAR=1 git status"));
     }
 
@@ -5501,7 +5514,7 @@ mod tests {
         assert_eq!(
             classify_command("/usr/bin/grep -rni pattern"),
             Classification::Supported {
-                rtk_equivalent: "rtk grep",
+                rtk_equivalent: "tokenaut grep",
                 category: "Files",
                 estimated_savings_pct: 75.0,
                 status: RtkStatus::Existing,
@@ -5514,7 +5527,7 @@ mod tests {
         assert_eq!(
             classify_command("/bin/ls -la"),
             Classification::Supported {
-                rtk_equivalent: "rtk ls",
+                rtk_equivalent: "tokenaut ls",
                 category: "Files",
                 estimated_savings_pct: 65.0,
                 status: RtkStatus::Existing,
@@ -5527,7 +5540,7 @@ mod tests {
         assert_eq!(
             classify_command("/usr/local/bin/git status"),
             Classification::Supported {
-                rtk_equivalent: "rtk git",
+                rtk_equivalent: "tokenaut git",
                 category: "Git",
                 estimated_savings_pct: 70.0,
                 status: RtkStatus::Existing,
@@ -5541,7 +5554,7 @@ mod tests {
         assert_eq!(
             classify_command("/usr/bin/find ."),
             Classification::Supported {
-                rtk_equivalent: "rtk find",
+                rtk_equivalent: "tokenaut find",
                 category: "Files",
                 estimated_savings_pct: 70.0,
                 status: RtkStatus::Existing,
@@ -5564,7 +5577,7 @@ mod tests {
         assert_eq!(
             classify_command("git -C /tmp status"),
             Classification::Supported {
-                rtk_equivalent: "rtk git",
+                rtk_equivalent: "tokenaut git",
                 category: "Git",
                 estimated_savings_pct: 70.0,
                 status: RtkStatus::Existing,
@@ -5577,7 +5590,7 @@ mod tests {
         assert_eq!(
             classify_command("git --no-pager log -5"),
             Classification::Supported {
-                rtk_equivalent: "rtk git",
+                rtk_equivalent: "tokenaut git",
                 category: "Git",
                 estimated_savings_pct: 70.0,
                 status: RtkStatus::Existing,
@@ -5590,7 +5603,7 @@ mod tests {
         assert_eq!(
             classify_command("git --git-dir /tmp/.git status"),
             Classification::Supported {
-                rtk_equivalent: "rtk git",
+                rtk_equivalent: "tokenaut git",
                 category: "Git",
                 estimated_savings_pct: 70.0,
                 status: RtkStatus::Existing,
@@ -5602,7 +5615,7 @@ mod tests {
     fn test_rewrite_git_dash_c() {
         assert_eq!(
             rewrite_command_no_prefixes("git -C /tmp status", &[]),
-            Some("rtk git -C /tmp status".to_string())
+            Some("tokenaut git -C /tmp status".to_string())
         );
     }
 
@@ -5610,7 +5623,7 @@ mod tests {
     fn test_rewrite_git_no_pager() {
         assert_eq!(
             rewrite_command_no_prefixes("git --no-pager log -5", &[]),
-            Some("rtk git --no-pager log -5".to_string())
+            Some("tokenaut git --no-pager log -5".to_string())
         );
     }
 
@@ -5656,7 +5669,7 @@ mod tests {
         assert_eq!(
             classify_command("wc -l src/main.rs"),
             Classification::Supported {
-                rtk_equivalent: "rtk wc",
+                rtk_equivalent: "tokenaut wc",
                 category: "Files",
                 estimated_savings_pct: 60.0,
                 status: RtkStatus::Existing,
@@ -5669,7 +5682,7 @@ mod tests {
         assert_eq!(
             classify_command("wc src/*.rs"),
             Classification::Supported {
-                rtk_equivalent: "rtk wc",
+                rtk_equivalent: "tokenaut wc",
                 category: "Files",
                 estimated_savings_pct: 60.0,
                 status: RtkStatus::Existing,
@@ -5681,7 +5694,7 @@ mod tests {
     fn test_rewrite_wc() {
         assert_eq!(
             rewrite_command_no_prefixes("wc -l src/main.rs", &[]),
-            Some("rtk wc -l src/main.rs".into())
+            Some("tokenaut wc -l src/main.rs".into())
         );
     }
 
@@ -5689,7 +5702,7 @@ mod tests {
     fn test_rewrite_wc_multi_file() {
         assert_eq!(
             rewrite_command_no_prefixes("wc src/*.rs", &[]),
-            Some("rtk wc src/*.rs".into())
+            Some("tokenaut wc src/*.rs".into())
         );
     }
 
@@ -5698,7 +5711,7 @@ mod tests {
         assert_eq!(
             classify_command("git log $(git rev-parse HEAD~1)"),
             Classification::Supported {
-                rtk_equivalent: "rtk git",
+                rtk_equivalent: "tokenaut git",
                 category: "Git",
                 estimated_savings_pct: 70.0,
                 status: RtkStatus::Existing,
@@ -5710,7 +5723,7 @@ mod tests {
     fn test_rewrite_command_substitution_passthrough() {
         assert_eq!(
             rewrite_command_no_prefixes("git log $(git rev-parse HEAD~1)", &[]),
-            Some("rtk git log $(git rev-parse HEAD~1)".into())
+            Some("tokenaut git log $(git rev-parse HEAD~1)".into())
         );
     }
 
@@ -5726,7 +5739,7 @@ mod tests {
     fn test_shell_prefix_noglob() {
         assert_eq!(
             rewrite_command_no_prefixes("noglob git status", &[]),
-            Some("noglob rtk git status".into())
+            Some("noglob tokenaut git status".into())
         );
     }
 
@@ -5734,7 +5747,7 @@ mod tests {
     fn test_shell_prefix_command() {
         assert_eq!(
             rewrite_command_no_prefixes("command git status", &[]),
-            Some("command rtk git status".into())
+            Some("command tokenaut git status".into())
         );
     }
 
@@ -5742,15 +5755,15 @@ mod tests {
     fn test_shell_prefix_builtin_exec_nocorrect() {
         assert_eq!(
             rewrite_command_no_prefixes("builtin git status", &[]),
-            Some("builtin rtk git status".into())
+            Some("builtin tokenaut git status".into())
         );
         assert_eq!(
             rewrite_command_no_prefixes("exec git status", &[]),
-            Some("exec rtk git status".into())
+            Some("exec tokenaut git status".into())
         );
         assert_eq!(
             rewrite_command_no_prefixes("nocorrect git status", &[]),
-            Some("nocorrect rtk git status".into())
+            Some("nocorrect tokenaut git status".into())
         );
     }
 
@@ -5769,7 +5782,7 @@ mod tests {
         let prefixes = vec!["shadowenv exec --".to_string()];
         assert_eq!(
             super::rewrite_command("shadowenv exec -- git status", &[], &prefixes),
-            Some("shadowenv exec -- rtk git status".into())
+            Some("shadowenv exec -- tokenaut git status".into())
         );
     }
 
@@ -5778,7 +5791,7 @@ mod tests {
         let prefixes = vec!["shadowenv exec --".to_string()];
         assert_eq!(
             super::rewrite_command("shadowenv exec -- cargo test", &[], &prefixes),
-            Some("shadowenv exec -- rtk cargo test".into())
+            Some("shadowenv exec -- tokenaut cargo test".into())
         );
     }
 
@@ -5807,7 +5820,7 @@ mod tests {
         let prefixes = vec!["shadowenv exec --".to_string()];
         assert_eq!(
             super::rewrite_command("noglob shadowenv exec -- git status", &[], &prefixes),
-            Some("noglob shadowenv exec -- rtk git status".into())
+            Some("noglob shadowenv exec -- tokenaut git status".into())
         );
     }
 
@@ -5816,7 +5829,7 @@ mod tests {
         let prefixes = vec!["bundle exec".to_string()];
         assert_eq!(
             super::rewrite_command("RAILS_ENV=test bundle exec git status", &[], &prefixes),
-            Some("RAILS_ENV=test bundle exec rtk git status".into())
+            Some("RAILS_ENV=test bundle exec tokenaut git status".into())
         );
     }
 
@@ -5824,7 +5837,7 @@ mod tests {
     fn test_env_prefix_composed_with_builtin() {
         assert_eq!(
             rewrite_command_no_prefixes("sudo noglob git status", &[]),
-            Some("sudo noglob rtk git status".into())
+            Some("sudo noglob tokenaut git status".into())
         );
     }
 
@@ -5833,7 +5846,7 @@ mod tests {
         let prefixes = vec!["shadowenv exec --".to_string(), "direnv exec .".to_string()];
         assert_eq!(
             super::rewrite_command("direnv exec . git status", &[], &prefixes),
-            Some("direnv exec . rtk git status".into())
+            Some("direnv exec . tokenaut git status".into())
         );
     }
 
@@ -5856,7 +5869,7 @@ mod tests {
         let prefixes = vec!["docker".to_string(), "docker exec app".to_string()];
         assert_eq!(
             super::rewrite_command("docker exec app git status", &[], &prefixes),
-            Some("docker exec app rtk git status".into())
+            Some("docker exec app tokenaut git status".into())
         );
     }
 
@@ -5885,7 +5898,7 @@ mod tests {
         let prefixes = vec!["".to_string(), "   ".to_string()];
         assert_eq!(
             super::rewrite_command("git status", &[], &prefixes),
-            Some("rtk git status".into())
+            Some("tokenaut git status".into())
         );
     }
 
@@ -5899,7 +5912,10 @@ mod tests {
                 &[],
                 &prefixes
             ),
-            Some("shadowenv exec -- rtk git status && shadowenv exec -- rtk cargo test".into())
+            Some(
+                "shadowenv exec -- tokenaut git status && shadowenv exec -- tokenaut cargo test"
+                    .into()
+            )
         );
     }
 
@@ -5934,7 +5950,7 @@ mod tests {
     fn test_python3_m_pytest() {
         assert_eq!(
             rewrite_command_no_prefixes("python3 -m pytest tests/", &[]),
-            Some("rtk pytest tests/".into())
+            Some("tokenaut pytest tests/".into())
         );
     }
 
@@ -5942,7 +5958,7 @@ mod tests {
     fn test_pip_show() {
         assert_eq!(
             rewrite_command_no_prefixes("pip show flask", &[]),
-            Some("rtk pip show flask".into())
+            Some("tokenaut pip show flask".into())
         );
     }
 
@@ -5950,7 +5966,7 @@ mod tests {
     fn test_gt_graphite() {
         assert_eq!(
             rewrite_command_no_prefixes("gt log", &[]),
-            Some("rtk gt log".into())
+            Some("tokenaut gt log".into())
         );
     }
 
@@ -5968,7 +5984,7 @@ mod tests {
     fn test_rewrite_pipe_then_and() {
         assert_eq!(
             rewrite_command_no_prefixes("git log | head -5 && git stash", &[]),
-            Some("rtk git log | head -5 && rtk git stash".into())
+            Some("tokenaut git log | head -5 && tokenaut git stash".into())
         );
     }
 
@@ -5976,7 +5992,7 @@ mod tests {
     fn test_rewrite_pipe_then_semicolon() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | head; git status", &[]),
-            Some("rtk cargo test | head; rtk git status".into())
+            Some("tokenaut cargo test | head; tokenaut git status".into())
         );
     }
 
@@ -5984,7 +6000,7 @@ mod tests {
     fn test_rewrite_pipe_then_or() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | grep FAIL || git stash", &[]),
-            Some("cargo test | rtk grep FAIL || rtk git stash".into())
+            Some("cargo test | tokenaut grep FAIL || tokenaut git stash".into())
         );
     }
 
@@ -5995,7 +6011,10 @@ mod tests {
                 "RUST_BACKTRACE=1 cargo test 2>&1 | grep FAILED && git stash",
                 &[]
             ),
-            Some("RUST_BACKTRACE=1 cargo test 2>&1 | rtk grep FAILED && rtk git stash".into())
+            Some(
+                "RUST_BACKTRACE=1 cargo test 2>&1 | tokenaut grep FAILED && tokenaut git stash"
+                    .into()
+            )
         );
     }
 
@@ -6003,7 +6022,7 @@ mod tests {
     fn test_rewrite_and_then_pipe() {
         assert_eq!(
             rewrite_command_no_prefixes("git status && cargo test | grep FAIL", &[]),
-            Some("rtk git status && cargo test | rtk grep FAIL".into())
+            Some("tokenaut git status && cargo test | tokenaut grep FAIL".into())
         );
     }
 
@@ -6011,7 +6030,7 @@ mod tests {
     fn test_rewrite_multi_pipe_then_and() {
         assert_eq!(
             rewrite_command_no_prefixes("git log | head | tail && git status", &[]),
-            Some("git log | head | tail && rtk git status".into())
+            Some("git log | head | tail && tokenaut git status".into())
         );
     }
 
@@ -6019,7 +6038,7 @@ mod tests {
     fn test_rewrite_pipeline_final_normalizes_prefixes() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | FOO=1 command grep FAILED", &[]),
-            Some("cargo test | FOO=1 command rtk grep FAILED".into())
+            Some("cargo test | FOO=1 command tokenaut grep FAILED".into())
         );
         assert_eq!(
             super::rewrite_command(
@@ -6027,7 +6046,7 @@ mod tests {
                 &[],
                 &["docker exec tools".into()]
             ),
-            Some("cargo test | docker exec tools rtk grep FAILED".into())
+            Some("cargo test | docker exec tools tokenaut grep FAILED".into())
         );
     }
 
@@ -6051,7 +6070,7 @@ mod tests {
         );
         assert_eq!(
             rewrite_command_no_prefixes("cargo test |& grep FAILED && git status", &[]),
-            Some("cargo test |& grep FAILED && rtk git status".into())
+            Some("cargo test |& grep FAILED && tokenaut git status".into())
         );
     }
 
@@ -6063,7 +6082,7 @@ mod tests {
         // the matcher see `\` as the command and bail out.
         assert_eq!(
             rewrite_command_no_prefixes("\\\ngit diff HEAD~1", &[]),
-            Some("rtk git diff HEAD~1".into())
+            Some("tokenaut git diff HEAD~1".into())
         );
     }
 
@@ -6072,7 +6091,7 @@ mod tests {
         // CRLF line ending — same shape, Windows shells / Git Bash.
         assert_eq!(
             rewrite_command_no_prefixes("\\\r\ngit diff HEAD~1", &[]),
-            Some("rtk git diff HEAD~1".into())
+            Some("tokenaut git diff HEAD~1".into())
         );
     }
 
@@ -6083,7 +6102,7 @@ mod tests {
         // `git diff HEAD~1` per bash semantics.
         assert_eq!(
             rewrite_command_no_prefixes("git diff \\\nHEAD~1", &[]),
-            Some("rtk git diff HEAD~1".into())
+            Some("tokenaut git diff HEAD~1".into())
         );
     }
 
@@ -6092,7 +6111,7 @@ mod tests {
         // Continuation followed by indentation — also collapsed.
         assert_eq!(
             rewrite_command_no_prefixes("git \\\n    diff HEAD~1", &[]),
-            Some("rtk git diff HEAD~1".into())
+            Some("tokenaut git diff HEAD~1".into())
         );
     }
 
@@ -6103,7 +6122,7 @@ mod tests {
         // regress the no-op fast path.
         assert_eq!(
             rewrite_command_no_prefixes("git diff HEAD~1", &[]),
-            Some("rtk git diff HEAD~1".into())
+            Some("tokenaut git diff HEAD~1".into())
         );
     }
 
@@ -6126,7 +6145,7 @@ mod tests {
         assert!(matches!(
             classify_command("phpunit tests/"),
             Classification::Supported {
-                rtk_equivalent: "rtk phpunit",
+                rtk_equivalent: "tokenaut phpunit",
                 ..
             }
         ));
@@ -6137,7 +6156,7 @@ mod tests {
         assert!(matches!(
             classify_command("vendor/bin/phpunit --filter EmailTest"),
             Classification::Supported {
-                rtk_equivalent: "rtk phpunit",
+                rtk_equivalent: "tokenaut phpunit",
                 ..
             }
         ));
@@ -6148,7 +6167,7 @@ mod tests {
         assert!(matches!(
             classify_command("php vendor/bin/phpunit tests/"),
             Classification::Supported {
-                rtk_equivalent: "rtk phpunit",
+                rtk_equivalent: "tokenaut phpunit",
                 ..
             }
         ));
@@ -6158,7 +6177,7 @@ mod tests {
     fn test_rewrite_phpunit() {
         assert_eq!(
             rewrite_command_no_prefixes("phpunit tests/", &[]),
-            Some("rtk phpunit tests/".into())
+            Some("tokenaut phpunit tests/".into())
         );
     }
 
@@ -6166,7 +6185,7 @@ mod tests {
     fn test_rewrite_vendor_bin_phpunit() {
         assert_eq!(
             rewrite_command_no_prefixes("vendor/bin/phpunit --filter EmailTest", &[]),
-            Some("rtk phpunit --filter EmailTest".into())
+            Some("tokenaut phpunit --filter EmailTest".into())
         );
     }
 
@@ -6177,23 +6196,23 @@ mod tests {
         // so the `./vendor/bin/<tool>` prefix must be present or rewrite no-ops.
         assert_eq!(
             rewrite_command_no_prefixes("./vendor/bin/pint --test", &[]),
-            Some("rtk pint --test".into())
+            Some("tokenaut pint --test".into())
         );
         assert_eq!(
             rewrite_command_no_prefixes("./vendor/bin/pest tests/", &[]),
-            Some("rtk pest tests/".into())
+            Some("tokenaut pest tests/".into())
         );
         assert_eq!(
             rewrite_command_no_prefixes("./vendor/bin/paratest", &[]),
-            Some("rtk paratest".into())
+            Some("tokenaut paratest".into())
         );
         assert_eq!(
             rewrite_command_no_prefixes("./vendor/bin/ecs check", &[]),
-            Some("rtk ecs check".into())
+            Some("tokenaut ecs check".into())
         );
         assert_eq!(
             rewrite_command_no_prefixes("./vendor/bin/phpunit --filter EmailTest", &[]),
-            Some("rtk phpunit --filter EmailTest".into())
+            Some("tokenaut phpunit --filter EmailTest".into())
         );
     }
 
@@ -6212,7 +6231,7 @@ mod tests {
         ] {
             assert_eq!(
                 rewrite_command_no_prefixes(cmd, &[]),
-                Some("rtk phpunit tests/".into()),
+                Some("tokenaut phpunit tests/".into()),
                 "form: {cmd}"
             );
         }
@@ -6221,7 +6240,7 @@ mod tests {
         for cmd in ["pint", "vendor/bin/pint", "./vendor/bin/pint", "./pint"] {
             assert_eq!(
                 rewrite_command_no_prefixes(cmd, &[]),
-                Some("rtk pint".into()),
+                Some("tokenaut pint".into()),
                 "form: {cmd}"
             );
         }
@@ -6239,7 +6258,7 @@ mod tests {
         assert!(matches!(
             classify_command("vendor/bin/phpstan analyse src/"),
             Classification::Supported {
-                rtk_equivalent: "rtk phpstan",
+                rtk_equivalent: "tokenaut phpstan",
                 ..
             }
         ));
@@ -6250,7 +6269,7 @@ mod tests {
         assert!(matches!(
             classify_command("phpstan analyse --level=9"),
             Classification::Supported {
-                rtk_equivalent: "rtk phpstan",
+                rtk_equivalent: "tokenaut phpstan",
                 ..
             }
         ));
@@ -6260,7 +6279,7 @@ mod tests {
     fn test_rewrite_phpstan_vendor_bin() {
         assert_eq!(
             rewrite_command_no_prefixes("vendor/bin/phpstan analyse src/", &[]),
-            Some("rtk phpstan analyse src/".into())
+            Some("tokenaut phpstan analyse src/".into())
         );
     }
 
@@ -6268,7 +6287,7 @@ mod tests {
     fn test_rewrite_phpstan_php_prefix() {
         assert_eq!(
             rewrite_command_no_prefixes("php vendor/bin/phpstan analyse", &[]),
-            Some("rtk phpstan analyse".into())
+            Some("tokenaut phpstan analyse".into())
         );
     }
 
@@ -6287,7 +6306,7 @@ mod tests {
         assert!(matches!(
             classify_command("vendor/bin/pest tests/"),
             Classification::Supported {
-                rtk_equivalent: "rtk pest",
+                rtk_equivalent: "tokenaut pest",
                 ..
             }
         ));
@@ -6298,7 +6317,7 @@ mod tests {
         assert!(matches!(
             classify_command("vendor/bin/pint --test"),
             Classification::Supported {
-                rtk_equivalent: "rtk pint",
+                rtk_equivalent: "tokenaut pint",
                 ..
             }
         ));
@@ -6309,7 +6328,7 @@ mod tests {
         assert!(matches!(
             classify_command("php artisan migrate"),
             Classification::Supported {
-                rtk_equivalent: "rtk php",
+                rtk_equivalent: "tokenaut php",
                 ..
             }
         ));
@@ -6320,7 +6339,7 @@ mod tests {
         assert!(matches!(
             classify_command("php run-tests.php Zend/tests/"),
             Classification::Supported {
-                rtk_equivalent: "rtk phpt",
+                rtk_equivalent: "tokenaut phpt",
                 ..
             }
         ));
@@ -6330,11 +6349,11 @@ mod tests {
     fn test_rewrite_phpt_run_tests() {
         assert_eq!(
             rewrite_command_no_prefixes("php run-tests.php Zend/tests/67468.phpt", &[]),
-            Some("rtk phpt Zend/tests/67468.phpt".into())
+            Some("tokenaut phpt Zend/tests/67468.phpt".into())
         );
         assert_eq!(
             rewrite_command_no_prefixes("php run-tests.php", &[]),
-            Some("rtk phpt".into())
+            Some("tokenaut phpt".into())
         );
     }
 
@@ -6359,7 +6378,7 @@ mod tests {
     fn test_toml_filter_rewrites_bare_command_but_not_wrapped_invocations() {
         assert_eq!(
             rewrite_command_no_prefixes("jj log", &[]),
-            Some("rtk jj log".into()),
+            Some("tokenaut jj log".into()),
         );
         assert_eq!(
             rewrite_command_no_prefixes("timeout 5 /usr/bin/jj log", &[]),

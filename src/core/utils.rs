@@ -283,6 +283,56 @@ pub fn fallback_tail(output: &str, label: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
+/// Adopt the state directory upstream rtk wrote, once per process.
+///
+/// `config.toml`, the tracking database, the tee logs and the trust store all live
+/// under `<platform dir>/<RTK_DATA_DIR>`, and the fork renamed that segment. Without
+/// this copy an existing user silently restarts from an empty history and default
+/// settings after the rename. Copy rather than move, so a still-installed `rtk`
+/// keeps working. Both platform bases are covered because they differ on Linux
+/// (`~/.config` vs `~/.local/share`) and coincide on macOS.
+pub fn adopt_legacy_state_dirs() {
+    use crate::core::constants::{LEGACY_DATA_DIR, RTK_DATA_DIR};
+
+    for base in [dirs::config_dir(), dirs::data_local_dir()]
+        .into_iter()
+        .flatten()
+    {
+        let current = base.join(RTK_DATA_DIR);
+        let legacy = base.join(LEGACY_DATA_DIR);
+        if current.exists() || !legacy.is_dir() {
+            continue;
+        }
+        // Stage then rename: the tracking database is the bulk of the copy, and a
+        // run interrupted halfway through it must not leave a truncated one in place.
+        let staging = base.join(format!("{RTK_DATA_DIR}.incoming"));
+        let _ = fs::remove_dir_all(&staging);
+        if create_private_dir(&staging).is_ok() && copy_dir_contents(&legacy, &staging).is_ok() {
+            let _ = fs::rename(&staging, &current);
+        }
+        let _ = fs::remove_dir_all(&staging);
+    }
+}
+
+fn copy_dir_contents(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(from)?.flatten() {
+        let target = to.join(entry.file_name());
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => {
+                create_private_dir(&target)?;
+                copy_dir_contents(&entry.path(), &target)?;
+            }
+            Ok(kind) if kind.is_file() => {
+                fs::copy(entry.path(), &target)?;
+                restrict_file(&target);
+            }
+            // Symlinks and anything else: nothing upstream writes, nothing to adopt.
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Create a directory owner-only (0700 on Unix), tightening one that already exists.
 pub fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
     fs::create_dir_all(path)?;

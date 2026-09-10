@@ -929,37 +929,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rtk"
-version = "0.48.0-tokenaut.1"
-dependencies = [
- "anyhow",
- "automod",
- "chrono",
- "clap",
- "codepage",
- "colored",
- "dirs",
- "encoding_rs",
- "flate2",
- "getrandom 0.4.2",
- "ignore",
- "libc",
- "oem_cp",
- "quick-xml",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "toml",
- "ureq",
- "walkdir",
- "which",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "rusqlite"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1211,6 +1180,37 @@ checksum = "42d3e9c45c09de15d06dd8acf5f4e0e399e85927b7f00711024eb7ae10fa4869"
 dependencies = [
  "displaydoc",
  "zerovec",
+]
+
+[[package]]
+name = "tokenaut"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "automod",
+ "chrono",
+ "clap",
+ "codepage",
+ "colored",
+ "dirs",
+ "encoding_rs",
+ "flate2",
+ "getrandom 0.4.2",
+ "ignore",
+ "libc",
+ "oem_cp",
+ "quick-xml",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "toml",
+ "ureq",
+ "walkdir",
+ "which",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

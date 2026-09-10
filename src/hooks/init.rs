@@ -4203,9 +4203,9 @@ fn run_opencode_only_mode(ctx: InitContext) -> Result<()> {
 
 // ─── Gemini CLI support ───────────────────────────────────────────
 
-/// Gemini hook wrapper script — delegates to `rtk hook gemini`
+/// Gemini hook wrapper script — delegates to `tokenaut hook gemini`
 const GEMINI_HOOK_SCRIPT: &str = r#"#!/bin/bash
-exec rtk hook gemini
+exec tokenaut hook gemini
 "#;
 
 fn resolve_gemini_dir() -> Result<PathBuf> {
@@ -4865,7 +4865,7 @@ pub(crate) const COPILOT_HOOK_JSON: &str = r#"{
     "PreToolUse": [
       {
         "type": "command",
-        "command": "rtk hook copilot",
+        "command": "tokenaut hook copilot",
         "cwd": ".",
         "timeout": 5
       }
@@ -8060,7 +8060,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(COPILOT_HOOK_JSON).unwrap();
 
         let vscode = &v["hooks"]["PreToolUse"][0];
-        assert_eq!(vscode["command"], "rtk hook copilot");
+        assert_eq!(vscode["command"], "tokenaut hook copilot");
         assert!(vscode["timeout"].is_number(), "VS Code uses `timeout`");
         assert_eq!(v["version"], 1);
 
@@ -8084,7 +8084,10 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&hook_path).unwrap()).unwrap();
 
-        assert_eq!(v["hooks"]["PreToolUse"][0]["command"], "rtk hook copilot");
+        assert_eq!(
+            v["hooks"]["PreToolUse"][0]["command"],
+            "tokenaut hook copilot"
+        );
         assert_eq!(v["version"], 1);
         assert!(v["hooks"].get("preToolUse").is_none());
     }
@@ -8118,7 +8121,10 @@ mod tests {
 
         let v: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&hook_path).unwrap()).unwrap();
-        assert_eq!(v["hooks"]["PreToolUse"][0]["command"], "rtk hook copilot");
+        assert_eq!(
+            v["hooks"]["PreToolUse"][0]["command"],
+            "tokenaut hook copilot"
+        );
         assert!(
             v["hooks"].get("preToolUse").is_none(),
             "re-running init must upgrade an old dual-schema install, dropping the \
@@ -8250,7 +8256,10 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&hook_path).unwrap()).unwrap();
         assert_eq!(v["version"], 1);
-        assert_eq!(v["hooks"]["PreToolUse"][0]["command"], "rtk hook copilot");
+        assert_eq!(
+            v["hooks"]["PreToolUse"][0]["command"],
+            "tokenaut hook copilot"
+        );
         assert!(v["hooks"].get("preToolUse").is_none());
     }
 
@@ -8279,7 +8288,10 @@ mod tests {
 
         let v: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&hook_path).unwrap()).unwrap();
-        assert_eq!(v["hooks"]["PreToolUse"][0]["command"], "rtk hook copilot");
+        assert_eq!(
+            v["hooks"]["PreToolUse"][0]["command"],
+            "tokenaut hook copilot"
+        );
         assert!(
             v["hooks"].get("preToolUse").is_none(),
             "re-running global init must upgrade an old dual-schema install"
@@ -8455,7 +8467,7 @@ mod tests {
         assert!(entry.contains(r#"name = "rtk-rewrite""#));
         assert!(entry.contains(r#"type = "pre_tool""#));
         assert!(entry.contains(r#"match = "bash""#));
-        assert!(entry.contains(r#"command = "rtk hook vibe""#));
+        assert!(entry.contains(r#"command = "tokenaut hook vibe""#));
         assert!(entry.contains("strict = false"));
     }
 
@@ -8482,7 +8494,7 @@ mod tests {
 
         let hooks_content = fs::read_to_string(vibe_dir.join(VIBE_HOOKS_FILE)).unwrap();
         assert!(hooks_content.contains(r#"name = "rtk-rewrite""#));
-        assert!(hooks_content.contains(r#"command = "rtk hook vibe""#));
+        assert!(hooks_content.contains(r#"command = "tokenaut hook vibe""#));
 
         let prompt_path = vibe_dir.join(VIBE_PROMPTS_SUBDIR).join(VIBE_PROMPT_FILE);
         assert!(prompt_path.exists());

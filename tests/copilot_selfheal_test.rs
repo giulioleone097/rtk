@@ -87,7 +87,7 @@ impl Sandbox {
     }
 
     fn run_hook(&self, payload: &str) -> (String, String, Option<i32>) {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_rtk"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tokenaut"))
             .args(["hook", "copilot"])
             .current_dir(&self.project)
             .env("HOME", &self.home)
@@ -145,7 +145,7 @@ fn legacy_invocation_heals_project_and_global_to_current_stock() {
 
     assert_hook_ok(LEGACY_PAYLOAD, &stdout, &stderr, code);
     assert!(
-        stdout.contains("rtk git status"),
+        stdout.contains("tokenaut git status"),
         "rewrite must still work during heal: {stdout}"
     );
     assert_eq!(read(&sb.project_config()), CURRENT_STOCK);
@@ -247,7 +247,7 @@ fn pascalcase_invocation_works_and_never_touches_configs() {
 
     assert_hook_ok(PASCAL_PAYLOAD, &stdout, &stderr, code);
     assert!(
-        stdout.contains("rtk git status"),
+        stdout.contains("tokenaut git status"),
         "PascalCase rewrite must work: {stdout}"
     );
     assert_eq!(read(&sb.project_config()), LEGACY_STOCK);
@@ -263,7 +263,7 @@ fn jetbrains_invocation_works_and_never_touches_configs() {
 
     assert_hook_ok(JETBRAINS_PAYLOAD, &stdout, &stderr, code);
     assert!(
-        stdout.contains("rtk git status"),
+        stdout.contains("tokenaut git status"),
         "JetBrains deny-with-suggestion must carry the rewrite: {stdout}"
     );
     assert_eq!(read(&sb.project_config()), LEGACY_STOCK);
@@ -343,7 +343,7 @@ fn non_stock_configs_are_never_modified_by_legacy_invocations() {
 
         assert_hook_ok(LEGACY_PAYLOAD, &stdout, &stderr, code);
         assert!(
-            stdout.contains("rtk git status"),
+            stdout.contains("tokenaut git status"),
             "{label}: hook must keep rewriting: {stdout}"
         );
         assert_eq!(
@@ -418,7 +418,7 @@ fn unwritable_hooks_dir_never_breaks_the_hook() {
 
     assert_hook_ok(LEGACY_PAYLOAD, &stdout, &stderr, code);
     assert!(
-        stdout.contains("rtk git status"),
+        stdout.contains("tokenaut git status"),
         "rewrite must survive write failure: {stdout}"
     );
     assert_eq!(

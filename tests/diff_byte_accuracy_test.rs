@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
-const RTK_BIN: &str = env!("CARGO_BIN_EXE_rtk");
+const RTK_BIN: &str = env!("CARGO_BIN_EXE_tokenaut");
 const DIFF_SUBCOMMAND: &str = "diff";
 const LF_FILE: &str = "lf.txt";
 const CRLF_FILE: &str = "crlf.txt";

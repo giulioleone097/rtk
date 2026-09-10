@@ -1,5 +1,6 @@
 //! Command filter modules organized by language ecosystem.
 
+pub mod bench;
 pub mod cloud;
 pub mod dotnet;
 pub mod git;

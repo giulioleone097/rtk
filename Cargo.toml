@@ -1,10 +1,10 @@
 [package]
-name = "rtk"
-version = "0.48.0-tokenaut.1"
+name = "tokenaut"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.91"
 authors = ["Patrick Szymkowiak"]
-description = "Rust Token Killer - High-performance CLI proxy to minimize LLM token consumption"
+description = "Token-saving hook engine and bench for Claude Code, based on rtk 0.48.0"
 license = "Apache 2.0"
 homepage = "https://www.rtk-ai.app"
 repository = "https://github.com/rtk-ai/rtk"
@@ -70,12 +70,12 @@ extended-description = "rtk filters and compresses command outputs before they r
 section = "utility"
 priority = "optional"
 assets = [
-    ["target/release/rtk", "usr/bin/", "755"],
+    ["target/release/tokenaut", "usr/bin/", "755"],
 ]
 # cargo-generate-rpm configuration
 [package.metadata.generate-rpm]
 assets = [
-    { source = "target/release/rtk", dest = "/usr/bin/rtk", mode = "755" },
+    { source = "target/release/tokenaut", dest = "/usr/bin/tokenaut", mode = "755" },
 ]
 
 [lints.rust]

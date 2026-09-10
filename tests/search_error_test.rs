@@ -6,7 +6,7 @@
 use std::process::Command;
 
 fn rtk(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_rtk"))
+    Command::new(env!("CARGO_BIN_EXE_tokenaut"))
         .env("LC_ALL", "C")
         .args(args)
         .output()

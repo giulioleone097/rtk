@@ -1,6 +1,6 @@
 //! Optional usage ping so we know which commands people run most.
 
-use super::constants::RTK_DATA_DIR;
+use super::constants::{CONFIG_TOML, RTK_DATA_DIR};
 use crate::core::config;
 use crate::core::tracking;
 use crate::hooks::constants::CLAUDE_DIR;
@@ -219,7 +219,7 @@ fn random_salt() -> String {
 pub fn salt_file_path() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("rtk")
+        .join(RTK_DATA_DIR)
         .join(".device_salt")
 }
 
@@ -346,7 +346,7 @@ fn build_meta_usage(tracker: &tracking::Tracker) -> serde_json::Value {
 /// Check if user has a config.toml file.
 fn detect_has_config() -> bool {
     dirs::config_dir()
-        .map(|d| d.join("rtk/config.toml").exists())
+        .map(|d| d.join(RTK_DATA_DIR).join(CONFIG_TOML).exists())
         .unwrap_or(false)
 }
 
@@ -409,9 +409,9 @@ fn count_custom_toml_filters() -> usize {
         }
     }
 
-    // Global: ~/.config/rtk/filters/*.toml
+    // Global: <config dir>/tokenaut/filters/*.toml
     if let Some(config_dir) = dirs::config_dir() {
-        if let Ok(entries) = std::fs::read_dir(config_dir.join("rtk/filters")) {
+        if let Ok(entries) = std::fs::read_dir(config_dir.join(RTK_DATA_DIR).join("filters")) {
             count += entries
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().extension().is_some_and(|ext| ext == "toml"))
@@ -499,14 +499,14 @@ mod tests {
     #[test]
     fn test_salt_file_path_is_in_rtk_dir() {
         let path = salt_file_path();
-        assert!(path.to_string_lossy().contains("rtk"));
+        assert!(path.to_string_lossy().contains(RTK_DATA_DIR));
         assert!(path.to_string_lossy().contains(".device_salt"));
     }
 
     #[test]
     fn test_marker_path_exists() {
         let path = telemetry_marker_path();
-        assert!(path.to_string_lossy().contains("rtk"));
+        assert!(path.to_string_lossy().contains(RTK_DATA_DIR));
     }
 
     #[test]

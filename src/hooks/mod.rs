@@ -12,7 +12,12 @@ pub mod rewrite_cmd;
 pub mod trust;
 pub mod verify_cmd;
 
+/// Both binary names are accepted: a settings file written by upstream rtk still
+/// registers a working hook here, so `hook check` must report it as installed
+/// instead of prompting for a second, duplicate entry.
 pub fn is_claude_hook_command(command: &str) -> bool {
+    use crate::core::constants::{BIN, LEGACY_BIN};
+
     let parts = crate::discover::lexer::shell_split(command);
     let [binary, hook, claude] = parts.as_slice() else {
         return false;
@@ -20,7 +25,7 @@ pub fn is_claude_hook_command(command: &str) -> bool {
 
     let binary_name = binary.rsplit(['/', '\\']).next().unwrap_or(binary);
 
-    binary_name == "rtk" && hook == "hook" && claude == "claude"
+    (binary_name == BIN || binary_name == LEGACY_BIN) && hook == "hook" && claude == "claude"
 }
 
 #[cfg(test)]

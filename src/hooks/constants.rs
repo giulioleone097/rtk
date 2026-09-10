@@ -9,13 +9,13 @@ pub const PRE_TOOL_USE_KEY: &str = "PreToolUse";
 pub const BEFORE_TOOL_KEY: &str = "BeforeTool";
 
 /// Native Rust hook command for Claude Code (replaces rtk-rewrite.sh).
-pub const CLAUDE_HOOK_COMMAND: &str = "rtk hook claude";
+pub const CLAUDE_HOOK_COMMAND: &str = "tokenaut hook claude";
 /// Native Rust hook command for Cursor (replaces rtk-rewrite.sh).
-pub const CURSOR_HOOK_COMMAND: &str = "rtk hook cursor";
+pub const CURSOR_HOOK_COMMAND: &str = "tokenaut hook cursor";
 /// Native Rust hook command for Factory Droid.
-pub const DROID_HOOK_COMMAND: &str = "rtk hook droid";
+pub const DROID_HOOK_COMMAND: &str = "tokenaut hook droid";
 /// Native Rust hook command for Mistral Vibe.
-pub const VIBE_HOOK_COMMAND: &str = "rtk hook vibe";
+pub const VIBE_HOOK_COMMAND: &str = "tokenaut hook vibe";
 
 pub const CONFIG_DIR: &str = ".config";
 pub const OPENCODE_SUBDIR: &str = "opencode";

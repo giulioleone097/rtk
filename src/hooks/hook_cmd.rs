@@ -201,9 +201,12 @@ fn heal_legacy_hook_file(path: &std::path::Path) -> bool {
         .get("PreToolUse")
         .and_then(|p| p.as_array())
         .is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|e| e.get("command").and_then(|c| c.as_str()) == Some("rtk hook copilot"))
+            entries.iter().any(|e| {
+                matches!(
+                    e.get("command").and_then(|c| c.as_str()),
+                    Some("tokenaut hook copilot") | Some("rtk hook copilot")
+                )
+            })
         });
     if !pascalcase_still_registered {
         return false;
@@ -559,7 +562,10 @@ fn sanitize_log_field(s: &str) -> String {
 
 fn audit_log_inner(action: &str, original: &str, rewritten: &str) -> Option<()> {
     let home = dirs::home_dir()?;
-    let dir = home.join(".local").join("share").join("rtk");
+    let dir = home
+        .join(".local")
+        .join("share")
+        .join(crate::core::constants::RTK_DATA_DIR);
     crate::core::utils::create_private_dir(&dir).ok()?;
     let path = dir.join("hook-audit.log");
     let mut file = crate::core::utils::open_private(
@@ -1130,7 +1136,7 @@ mod tests {
 
     #[test]
     fn test_get_rewritten_already_rtk() {
-        assert!(get_rewritten("rtk git status").is_none());
+        assert!(get_rewritten("tokenaut git status").is_none());
     }
 
     #[test]
@@ -1146,14 +1152,14 @@ mod tests {
     #[test]
     fn test_vscode_allow_rewrite_sets_permission_allow() {
         let r = vscode_response_from_decision(
-            HookDecision::AllowRewrite("rtk git status".into()),
+            HookDecision::AllowRewrite("tokenaut git status".into()),
             "git status",
         )
         .unwrap();
         assert_eq!(r["hookSpecificOutput"]["permissionDecision"], "allow");
         assert_eq!(
             r["hookSpecificOutput"]["updatedInput"]["command"],
-            "rtk git status"
+            "tokenaut git status"
         );
     }
 
@@ -1165,7 +1171,7 @@ mod tests {
         // Copilot CLI 1.0.66+ treats it as authoritative and forces a blocking
         // dialog with no "remember" option on every rewritten command.
         let r = vscode_response_from_decision(
-            HookDecision::AskRewrite("rtk cargo test".into()),
+            HookDecision::AskRewrite("tokenaut cargo test".into()),
             "cargo test",
         )
         .unwrap();
@@ -1179,7 +1185,7 @@ mod tests {
         );
         assert_eq!(
             r["hookSpecificOutput"]["updatedInput"]["command"],
-            "rtk cargo test"
+            "tokenaut cargo test"
         );
     }
 
@@ -1207,7 +1213,7 @@ mod tests {
         // Copilot CLI 1.0.66+ forced-prompt bug from #3037.
         let r = copilot_cli_response_from_decision(
             &cli_args("cargo test"),
-            HookDecision::AskRewrite("rtk cargo test".into()),
+            HookDecision::AskRewrite("tokenaut cargo test".into()),
             "cargo test",
         )
         .unwrap();
@@ -1215,19 +1221,19 @@ mod tests {
             r.get("permissionDecision").is_none(),
             "AskRewrite must NOT set permissionDecision — the host's native prompt/allowlist stays in control"
         );
-        assert_eq!(r["modifiedArgs"]["command"], "rtk cargo test");
+        assert_eq!(r["modifiedArgs"]["command"], "tokenaut cargo test");
     }
 
     #[test]
     fn test_copilot_cli_allow_rewrite_returns_allow() {
         let r = copilot_cli_response_from_decision(
             &cli_args("cargo test"),
-            HookDecision::AllowRewrite("rtk cargo test".into()),
+            HookDecision::AllowRewrite("tokenaut cargo test".into()),
             "cargo test",
         )
         .unwrap();
         assert_eq!(r["permissionDecision"], "allow");
-        assert_eq!(r["modifiedArgs"]["command"], "rtk cargo test");
+        assert_eq!(r["modifiedArgs"]["command"], "tokenaut cargo test");
     }
 
     #[test]
@@ -1255,7 +1261,7 @@ mod tests {
     #[test]
     fn test_copilot_ide_rewrite_returns_deny_with_suggestion() {
         let response = copilot_ide_response_from_decision(
-            HookDecision::AskRewrite("rtk git status".into()),
+            HookDecision::AskRewrite("tokenaut git status".into()),
             "git status",
         )
         .unwrap();
@@ -1263,7 +1269,7 @@ mod tests {
         assert!(response["permissionDecisionReason"]
             .as_str()
             .unwrap()
-            .contains("rtk git status"));
+            .contains("tokenaut git status"));
         assert!(response.get("modifiedArgs").is_none());
     }
 
@@ -1272,7 +1278,7 @@ mod tests {
         // The IDE host ignores modifiedArgs, so an Allow-with-rewrite decision
         // must still surface as a deny-with-suggestion, exactly like AskRewrite.
         let response = copilot_ide_response_from_decision(
-            HookDecision::AllowRewrite("rtk git status".into()),
+            HookDecision::AllowRewrite("tokenaut git status".into()),
             "git status",
         )
         .unwrap();
@@ -1280,7 +1286,7 @@ mod tests {
         assert!(response["permissionDecisionReason"]
             .as_str()
             .unwrap()
-            .contains("rtk git status"));
+            .contains("tokenaut git status"));
         assert!(response.get("modifiedArgs").is_none());
     }
 
@@ -1307,7 +1313,9 @@ mod tests {
 
     #[test]
     fn test_copilot_cli_passthrough_already_rtk() {
-        assert!(copilot_cli_response("rtk cargo test", &cli_args("rtk cargo test")).is_none());
+        assert!(
+            copilot_cli_response("tokenaut cargo test", &cli_args("tokenaut cargo test")).is_none()
+        );
     }
 
     #[test]
@@ -1325,7 +1333,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             r["modifiedArgs"]["command"],
-            "RUST_LOG=debug rtk cargo test"
+            "RUST_LOG=debug tokenaut cargo test"
         );
     }
 
@@ -1339,12 +1347,12 @@ mod tests {
         });
         let r = copilot_cli_response_from_decision(
             &args,
-            HookDecision::AskRewrite("rtk cargo install ripgrep".into()),
+            HookDecision::AskRewrite("tokenaut cargo install ripgrep".into()),
             "cargo install ripgrep",
         )
         .unwrap();
         let modified = &r["modifiedArgs"];
-        assert_eq!(modified["command"], "rtk cargo install ripgrep");
+        assert_eq!(modified["command"], "tokenaut cargo install ripgrep");
         assert_eq!(modified["description"], "install ripgrep");
         assert_eq!(modified["initial_wait"], 30);
         assert_eq!(modified["mode"], "sync");
@@ -1366,7 +1374,7 @@ mod tests {
             let r = end_to_end(cmd).unwrap_or_else(|| panic!("expected rewrite for {cmd:?}"));
             assert_eq!(
                 r["modifiedArgs"]["command"].as_str().unwrap(),
-                format!("rtk {cmd}"),
+                format!("tokenaut {cmd}"),
                 "safe form {cmd:?} must rewrite",
             );
         }
@@ -1440,7 +1448,7 @@ mod tests {
             "decision": "allow",
             "hookSpecificOutput": {
                 "tool_input": {
-                    "command": "rtk git status"
+                    "command": "tokenaut git status"
                 }
             }
         });
@@ -1448,7 +1456,7 @@ mod tests {
         assert_eq!(json["decision"], "allow");
         assert_eq!(
             json["hookSpecificOutput"]["tool_input"]["command"],
-            "rtk git status"
+            "tokenaut git status"
         );
     }
 
@@ -1456,15 +1464,15 @@ mod tests {
     fn test_gemini_hook_uses_rewrite_command() {
         assert_eq!(
             rewrite_command_no_prefixes("git status", &[]),
-            Some("rtk git status".into())
+            Some("tokenaut git status".into())
         );
         assert_eq!(
             rewrite_command_no_prefixes("cargo test", &[]),
-            Some("rtk cargo test".into())
+            Some("tokenaut cargo test".into())
         );
         assert_eq!(
-            rewrite_command_no_prefixes("rtk git status", &[]),
-            Some("rtk git status".into())
+            rewrite_command_no_prefixes("tokenaut git status", &[]),
+            Some("tokenaut git status".into())
         );
         assert_eq!(rewrite_command_no_prefixes("cat <<EOF", &[]), None);
     }
@@ -1478,7 +1486,7 @@ mod tests {
         );
         assert_eq!(
             rewrite_command_no_prefixes("git status", &excluded),
-            Some("rtk git status".into())
+            Some("tokenaut git status".into())
         );
     }
 
@@ -1486,7 +1494,7 @@ mod tests {
     fn test_gemini_hook_env_prefix_preserved() {
         assert_eq!(
             rewrite_command_no_prefixes("RUST_LOG=debug cargo test", &[]),
-            Some("RUST_LOG=debug rtk cargo test".into())
+            Some("RUST_LOG=debug tokenaut cargo test".into())
         );
     }
 
@@ -1584,7 +1592,7 @@ mod tests {
         match process_claude_payload_from_decision(
             &v,
             "git status",
-            HookDecision::AllowRewrite("rtk git status".to_string()),
+            HookDecision::AllowRewrite("tokenaut git status".to_string()),
         ) {
             PayloadAction::Rewrite {
                 decision,
@@ -1592,7 +1600,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(decision, HookOutcome::Allow);
-                assert_eq!(rewritten, "rtk git status");
+                assert_eq!(rewritten, "tokenaut git status");
             }
             other => {
                 panic!("expected Rewrite, got a different PayloadAction variant instead: {other:?}")
@@ -1606,7 +1614,7 @@ mod tests {
         match process_claude_payload_from_decision(
             &v,
             "git status",
-            HookDecision::AskRewrite("rtk git status".to_string()),
+            HookDecision::AskRewrite("tokenaut git status".to_string()),
         ) {
             PayloadAction::Rewrite { decision, .. } => assert_eq!(decision, HookOutcome::Ask),
             other => {
@@ -1653,7 +1661,7 @@ mod tests {
             .pointer("/hookSpecificOutput/updatedInput/command")
             .and_then(|c| c.as_str())
             .unwrap();
-        assert_eq!(cmd, "rtk git status");
+        assert_eq!(cmd, "tokenaut git status");
     }
 
     #[test]
@@ -1662,7 +1670,7 @@ mod tests {
         let result = run_claude_inner(&input).unwrap();
         let v: Value = serde_json::from_str(&result).unwrap();
         let updated = &v["hookSpecificOutput"]["updatedInput"];
-        assert_eq!(updated["command"], "rtk git status");
+        assert_eq!(updated["command"], "tokenaut git status");
         assert_eq!(updated["timeout"], 30000);
         assert_eq!(updated["description"], "Check repo status");
     }
@@ -1699,7 +1707,7 @@ mod tests {
 
     #[test]
     fn test_claude_already_rtk_passthrough() {
-        assert!(run_claude_inner(&claude_input("rtk git status")).is_none());
+        assert!(run_claude_inner(&claude_input("tokenaut git status")).is_none());
     }
 
     #[test]
@@ -1725,7 +1733,7 @@ mod tests {
             .pointer("/hookSpecificOutput/updatedInput/command")
             .and_then(|c| c.as_str())
             .unwrap();
-        assert_eq!(cmd, "GIT_PAGER=cat rtk git status");
+        assert_eq!(cmd, "GIT_PAGER=cat tokenaut git status");
     }
 
     #[test]
@@ -1736,7 +1744,7 @@ mod tests {
             .pointer("/hookSpecificOutput/updatedInput/command")
             .and_then(|c| c.as_str())
             .unwrap();
-        assert_eq!(cmd, "rtk git add . && rtk cargo test");
+        assert_eq!(cmd, "tokenaut git add . && tokenaut cargo test");
     }
 
     #[test]
@@ -1747,7 +1755,7 @@ mod tests {
             .pointer("/hookSpecificOutput/updatedInput/command")
             .and_then(|c| c.as_str())
             .unwrap();
-        assert_eq!(cmd, "cargo test | rtk grep FAILED");
+        assert_eq!(cmd, "cargo test | tokenaut grep FAILED");
     }
 
     #[test]
@@ -1782,7 +1790,7 @@ mod tests {
         let v: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(
             v["hookSpecificOutput"]["updatedInput"]["command"],
-            "rtk git status"
+            "tokenaut git status"
         );
     }
 
@@ -1806,7 +1814,7 @@ mod tests {
         let v: Value = serde_json::from_str(&result).unwrap();
         // Cursor preToolUse expects allow/deny for rewrite application.
         assert_eq!(v["permission"], "allow");
-        assert_eq!(v["updated_input"]["command"], "rtk git status");
+        assert_eq!(v["updated_input"]["command"], "tokenaut git status");
         assert!(v.get("hookSpecificOutput").is_none());
         // `continue: true` keeps the Cursor preToolUse panel from collapsing
         // to `Output: {}`; without it the rewrite is invisible to users.
@@ -1818,7 +1826,7 @@ mod tests {
         let result = run_cursor_inner(&cursor_input("git status"));
         let v: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["permission"], "ask");
-        assert_eq!(v["updated_input"]["command"], "rtk git status");
+        assert_eq!(v["updated_input"]["command"], "tokenaut git status");
         // `continue: true` keeps the Cursor preToolUse panel from collapsing
         // to `Output: {}`; without it the rewrite is invisible to users.
         assert_eq!(v["continue"], true);
@@ -1868,7 +1876,7 @@ mod tests {
 
     #[test]
     fn test_cursor_already_rtk_passthrough() {
-        let result = run_cursor_inner(&cursor_input("rtk git status"));
+        let result = run_cursor_inner(&cursor_input("tokenaut git status"));
         assert_eq!(result, "{}");
     }
 
@@ -1890,7 +1898,7 @@ mod tests {
         assert_eq!(v["permission"], "allow");
         assert_eq!(
             v["updated_input"]["command"],
-            "cd \"/tmp/proj\" && rtk git status"
+            "cd \"/tmp/proj\" && tokenaut git status"
         );
     }
 
@@ -1905,7 +1913,7 @@ mod tests {
         let v: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["continue"], true);
         assert_eq!(v["permission"], "allow");
-        assert_eq!(v["updated_input"]["command"], "rtk git status");
+        assert_eq!(v["updated_input"]["command"], "tokenaut git status");
     }
 
     #[test]
@@ -1920,7 +1928,7 @@ mod tests {
         let v: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["continue"], true);
         assert_eq!(v["permission"], "allow");
-        assert_eq!(v["updated_input"]["command"], "rtk git status");
+        assert_eq!(v["updated_input"]["command"], "tokenaut git status");
     }
 
     // --- Audit logging ---
@@ -1928,7 +1936,7 @@ mod tests {
     #[test]
     fn test_audit_log_silent_when_disabled() {
         std::env::remove_var("RTK_HOOK_AUDIT");
-        audit_log("test", "git status", "rtk git status");
+        audit_log("test", "git status", "tokenaut git status");
     }
 
     #[test]
@@ -1945,7 +1953,7 @@ mod tests {
                 .open(&log_path)
                 .unwrap();
             let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S");
-            writeln!(file, "{} | rewrite | git status | rtk git status", ts).unwrap();
+            writeln!(file, "{} | rewrite | git status | tokenaut git status", ts).unwrap();
         }
 
         let content = std::fs::read_to_string(&log_path).unwrap();
@@ -1958,7 +1966,7 @@ mod tests {
         );
         assert_eq!(parts[1], "rewrite");
         assert_eq!(parts[2], "git status");
-        assert_eq!(parts[3], "rtk git status");
+        assert_eq!(parts[3], "tokenaut git status");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2138,7 +2146,7 @@ mod tests {
         assert_eq!(v["decision"], "allow");
         assert_eq!(
             v["hookSpecificOutput"]["tool_input"]["command"],
-            "rtk git status"
+            "tokenaut git status"
         );
     }
 
@@ -2162,7 +2170,7 @@ mod tests {
         assert_eq!(v["decision"], "allow");
         assert_eq!(
             v["hookSpecificOutput"]["tool_input"]["command"],
-            "rtk git status"
+            "tokenaut git status"
         );
     }
 
@@ -2221,7 +2229,7 @@ mod tests {
             .and_then(|c| c.as_str())
             .unwrap_or("");
         assert!(
-            updated.starts_with("rtk "),
+            updated.starts_with("tokenaut "),
             "expected rtk-prefixed rewrite, got `{updated}`"
         );
         assert_eq!(
@@ -2249,7 +2257,7 @@ mod tests {
         assert_eq!(
             v.pointer("/hookSpecificOutput/updatedInput/command")
                 .and_then(|c| c.as_str()),
-            Some("rtk git status")
+            Some("tokenaut git status")
         );
     }
 
@@ -2264,7 +2272,7 @@ mod tests {
         assert!(
             v.pointer("/hookSpecificOutput/updatedInput/command")
                 .and_then(|c| c.as_str())
-                .is_some_and(|c| c.starts_with("rtk ")),
+                .is_some_and(|c| c.starts_with("tokenaut ")),
             "expected rtk-prefixed rewrite"
         );
         assert!(
@@ -2377,7 +2385,7 @@ mod tests {
         let out = droid_response_from_decision(
             &v,
             "git status",
-            HookDecision::AllowRewrite("rtk git status".to_string()),
+            HookDecision::AllowRewrite("tokenaut git status".to_string()),
         )
         .expect("rewrite expected");
         assert!(
@@ -2388,7 +2396,7 @@ mod tests {
         assert_eq!(
             out.pointer("/hookSpecificOutput/updatedInput/command")
                 .and_then(|c| c.as_str()),
-            Some("rtk git status")
+            Some("tokenaut git status")
         );
     }
 
@@ -2448,7 +2456,7 @@ mod tests {
             .and_then(|c| c.as_str())
             .unwrap_or("");
         assert!(
-            rewritten.starts_with("rtk "),
+            rewritten.starts_with("tokenaut "),
             "expected rtk-prefixed rewrite, got `{rewritten}`"
         );
         assert!(
@@ -2470,7 +2478,7 @@ mod tests {
         assert_eq!(
             v.pointer("/hook_specific_output/tool_input/command")
                 .and_then(|c| c.as_str()),
-            Some("rtk git status")
+            Some("tokenaut git status")
         );
     }
 

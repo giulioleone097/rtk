@@ -230,7 +230,10 @@ fn would_be_covered_without_bypass(
 /// directly from the transcript (the model really did invoke `rtk`), not a guess.
 pub(crate) fn is_already_rtk(cmd: &str) -> bool {
     let trimmed = cmd.trim();
-    trimmed.starts_with("rtk ") && !trimmed.starts_with("rtk proxy")
+    match trimmed.strip_prefix(crate::core::constants::BIN) {
+        Some(rest) => rest.starts_with(' ') && !rest.starts_with(" proxy"),
+        None => false,
+    }
 }
 
 /// Aggregation bucket for supported commands.
@@ -781,14 +784,14 @@ mod tests {
 
     #[test]
     fn test_is_already_rtk_plain_rewrite() {
-        assert!(is_already_rtk("rtk grep -n foo bar.py"));
+        assert!(is_already_rtk("tokenaut grep -n foo bar.py"));
     }
 
     #[test]
     fn test_is_already_rtk_excludes_proxy_escape_hatch() {
         // rtk#3148 secondary finding: `rtk proxy` deliberately bypasses filtering,
         // so it must not count as coverage.
-        assert!(!is_already_rtk("rtk proxy grep -n foo bar.py"));
+        assert!(!is_already_rtk("tokenaut proxy grep -n foo bar.py"));
     }
 
     #[test]

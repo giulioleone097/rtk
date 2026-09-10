@@ -6,7 +6,7 @@
 use std::process::Command;
 
 fn rtk() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rtk"))
+    Command::new(env!("CARGO_BIN_EXE_tokenaut"))
 }
 
 fn rg_available() -> bool {

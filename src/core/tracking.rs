@@ -1979,9 +1979,11 @@ mod tests {
 
         env::remove_var("RTK_DB_PATH");
         let db_path = get_db_path().expect("Failed to get db path");
+        let expected = std::path::Path::new(RTK_DATA_DIR).join(HISTORY_DB);
         assert!(
-            db_path.ends_with("rtk/history.db"),
-            "expected default path ending with rtk/history.db, got: {}",
+            db_path.ends_with(&expected),
+            "expected default path ending with {}, got: {}",
+            expected.display(),
             db_path.display()
         );
     }

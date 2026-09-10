@@ -22,7 +22,7 @@ fn run_with_stdin(command: &mut Command, input: &[u8]) -> Output {
 #[test]
 fn wc_reads_piped_stdin() {
     let output = run_with_stdin(
-        Command::new(env!("CARGO_BIN_EXE_rtk")).args(["wc", "-l"]),
+        Command::new(env!("CARGO_BIN_EXE_tokenaut")).args(["wc", "-l"]),
         b"alpha\nbeta\n",
     );
 
@@ -34,7 +34,7 @@ fn wc_reads_piped_stdin() {
 fn wc_preserves_native_failure_exit_code() {
     let invalid_option = "--definitely-invalid-rtk-test-option";
     let rtk = run_with_stdin(
-        Command::new(env!("CARGO_BIN_EXE_rtk")).args(["wc", invalid_option]),
+        Command::new(env!("CARGO_BIN_EXE_tokenaut")).args(["wc", invalid_option]),
         b"input\n",
     );
     let native = run_with_stdin(Command::new("wc").arg(invalid_option), b"input\n");

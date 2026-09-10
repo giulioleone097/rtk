@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 fn rtk() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rtk"))
+    Command::new(env!("CARGO_BIN_EXE_tokenaut"))
 }
 
 /// Run rtk with `input` fed on stdin; returns (stdout, exit_code).
