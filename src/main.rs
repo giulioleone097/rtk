@@ -925,6 +925,8 @@ enum Commands {
         #[arg(long)]
         gaps: bool,
     },
+    /// Run the MCP server over stdio (tools: ctx_batch_execute, ctx_search)
+    Mcp,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2742,6 +2744,7 @@ fn run_cli() -> Result<i32> {
             // print a message for, so the exit code is returned directly.
             cmds::bench::run(days, &config_dir, gaps)
         }
+        Commands::Mcp => cmds::mcp::run()?,
 
         Commands::Rewrite { args } => {
             let cmd = args.join(" ");
