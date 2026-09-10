@@ -1061,6 +1061,100 @@ fn rewrite_pipeline_final_stage(
     })
 }
 
+/// Consumers that only display the head of the stream they are handed. None of
+/// them splits its input into fields, so what changes when the producer is
+/// rewritten is what a human reads, never what a program computes.
+///
+/// `tail`, `less` and `more` are deliberately absent: an RTK filter emits a
+/// capped or regrouped view, so `git log | tail -5` would show the end of the
+/// 10 newest commits instead of the oldest commits the raw pipeline prints, and
+/// a pager can never reach anything the cap already dropped.
+///
+/// ceiling: `head -N` after a rewrite reads the first N lines of the RTK view
+/// (header plus capped matches), so it shows fewer than N matches; and RTK
+/// buffers the producer, so `| head` no longer stops it early (`find /usr |
+/// head -3` measured 3.2 s against 0.02 s raw). Upgrade trigger: pass N into
+/// the producer filter's cap and stream the filtered output.
+const DISPLAY_ONLY_CONSUMERS: &[&str] = &["head", "cat"];
+
+/// A [`DISPLAY_ONLY_CONSUMERS`] stage invoked with nothing but flags and counts
+/// (`head -5`, `head -n 20`, `cat`). A bare word operand disqualifies the stage:
+/// `cat file` reads that file instead of the pipe, and any other word could be a
+/// command in disguise.
+fn is_display_only_consumer(stage: &str) -> bool {
+    let mut words = stage.split_whitespace();
+    let Some(name) = words.next() else {
+        return false;
+    };
+    DISPLAY_ONLY_CONSUMERS.contains(&name)
+        && words.all(|word| word.starts_with('-') || word.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Issues #3722, #3578 and #3442: a pipeline never rewrites its producer,
+/// because an RTK filter reformats output and a downstream stage that parses it
+/// (`cut`, `sed`, `awk`, `jq`, `xargs`, …) would then compute different values
+/// (#3558). That risk disappears when every stage after the producer only
+/// displays what it reads, so `producer | head -5` is exactly as safe to rewrite
+/// as `producer` alone.
+///
+/// v0.48.0 keeps the producer raw before every consumer (commits b3936b8 and
+/// 590445e); this fork rewrites it before `head` and `cat` only. Consumer stages
+/// are copied
+/// byte-for-byte, and one stage outside the set anywhere in the pipeline keeps
+/// the general raw-producer contract for the whole pipeline.
+fn rewrite_producer_before_display_only_sinks(
+    cmd: &str,
+    tokens: &[ParsedToken],
+    seg_start: usize,
+    first_pipe_offset: usize,
+    analysis: PipelineAnalysis,
+    excluded: &[ExcludePattern],
+    transparent_prefixes: &[String],
+) -> Option<String> {
+    let end_offset = analysis.end_offset;
+    let mut stage_start: Option<usize> = None;
+    for token in tokens {
+        if token.offset < first_pipe_offset || token.offset >= end_offset {
+            continue;
+        }
+        let TokenKind::Pipe(kind) = token.kind else {
+            continue;
+        };
+        // `|&` also carries stderr, which no RTK filter reproduces.
+        if kind != PipeKind::Stdout {
+            return None;
+        }
+        if let Some(start) = stage_start {
+            if !is_display_only_consumer(cmd[start..token.offset].trim()) {
+                return None;
+            }
+        }
+        stage_start = Some(token.offset + token.value.len());
+    }
+
+    let last_stage_start = stage_start?;
+    if !is_display_only_consumer(cmd[last_stage_start..end_offset].trim()) {
+        return None;
+    }
+
+    let producer = cmd[seg_start..first_pipe_offset].trim();
+    let rewritten = rewrite_segment_inner(
+        producer,
+        excluded,
+        transparent_prefixes,
+        RewriteContext::Normal,
+        0,
+    )?;
+    if rewritten == producer {
+        return None;
+    }
+    Some(format!(
+        "{} {}",
+        rewritten,
+        cmd[first_pipe_offset..end_offset].trim()
+    ))
+}
+
 /// Rewrite a compound command (with `&&`, `||`, `;`, `|`) by rewriting each segment.
 fn rewrite_compound(
     cmd: &str,
@@ -1120,7 +1214,18 @@ fn rewrite_compound(
                     analysis,
                     excluded,
                     transparent_prefixes,
-                );
+                )
+                .or_else(|| {
+                    rewrite_producer_before_display_only_sinks(
+                        cmd,
+                        &tokens,
+                        seg_start,
+                        tok.offset,
+                        analysis,
+                        excluded,
+                        transparent_prefixes,
+                    )
+                });
 
                 if let Some(rewritten) = rewritten_pipeline {
                     any_changed = true;
@@ -4857,6 +4962,75 @@ mod tests {
         );
     }
 
+    /// Pipelines whose consumer stages only page or truncate the stream
+    /// (issues #3722, #3578, #3442). The producer is rewritten exactly as it
+    /// would be on its own; every consumer stage is kept byte-for-byte. A stage
+    /// that parses its input structurally keeps the whole pipeline raw (#3558).
+    mod display_only_pipelines {
+        use super::rewrite_command_no_prefixes;
+
+        #[test]
+        fn test_rewrite_producer_before_head() {
+            assert_eq!(
+                rewrite_command_no_prefixes("grep -n foo x | head -5", &[]),
+                Some("rtk grep -n foo x | head -5".into())
+            );
+        }
+
+        #[test]
+        fn test_rewrite_producer_before_head_keeps_cat_read() {
+            assert_eq!(
+                rewrite_command_no_prefixes("cat -n /tmp/x | head -50", &[]),
+                Some("rtk read -n /tmp/x | head -50".into())
+            );
+        }
+
+        #[test]
+        fn test_truncating_consumer_stays_raw() {
+            // An RTK view is capped and regrouped, so its tail is not the tail
+            // of the raw output; a pager cannot reach past the cap either.
+            assert_eq!(rewrite_command_no_prefixes("git log | tail -5", &[]), None);
+            assert_eq!(rewrite_command_no_prefixes("git log | less", &[]), None);
+        }
+
+        #[test]
+        fn test_consumer_with_file_operand_stays_raw() {
+            // `head -50 build.log` reads the file, not the pipe.
+            assert_eq!(
+                rewrite_command_no_prefixes("cargo test | head -50 build.log", &[]),
+                None
+            );
+        }
+
+        #[test]
+        fn test_parser_consumer_stays_raw() {
+            // `cut` splits fields out of the bytes it reads, so an RTK-filtered
+            // producer would silently change what it computes.
+            assert_eq!(
+                rewrite_command_no_prefixes("grep -n foo x | cut -f1", &[]),
+                None
+            );
+        }
+
+        #[test]
+        fn test_awk_consumer_stays_raw() {
+            assert_eq!(
+                rewrite_command_no_prefixes("ls -la | awk '{print $1}'", &[]),
+                None
+            );
+        }
+
+        #[test]
+        fn test_quoted_pipe_is_not_a_stage_separator() {
+            // The only pipeline separator is the unquoted `|`: the quoted one
+            // belongs to the pattern, so the producer is the whole `grep` call.
+            assert_eq!(
+                rewrite_command_no_prefixes("grep -n 'a | b' x | head -1", &[]),
+                Some("rtk grep -n 'a | b' x | head -1".into())
+            );
+        }
+    }
+
     #[test]
     fn test_rewrite_compound_four_segments() {
         assert_eq!(
@@ -5728,7 +5902,7 @@ mod tests {
     fn test_rewrite_pipe_then_and() {
         assert_eq!(
             rewrite_command_no_prefixes("git log | head -5 && git stash", &[]),
-            Some("git log | head -5 && rtk git stash".into())
+            Some("rtk git log | head -5 && rtk git stash".into())
         );
     }
 
@@ -5736,7 +5910,7 @@ mod tests {
     fn test_rewrite_pipe_then_semicolon() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | head; git status", &[]),
-            Some("cargo test | head; rtk git status".into())
+            Some("rtk cargo test | head; rtk git status".into())
         );
     }
 
