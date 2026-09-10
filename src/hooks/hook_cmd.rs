@@ -734,6 +734,13 @@ pub fn run_claude() -> Result<()> {
         }
     };
 
+    if v.get("tool_name").and_then(|t| t.as_str()) == Some("Read") {
+        if let Some(output) = super::read_nudge::read_hook_output(&v) {
+            let _ = writeln!(io::stdout(), "{output}");
+        }
+        return Ok(());
+    }
+
     match process_claude_payload(&v) {
         PayloadAction::Rewrite {
             cmd,

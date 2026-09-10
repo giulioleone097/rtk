@@ -8,6 +8,7 @@ pub mod hook_cmd;
 pub mod init;
 pub mod integrity;
 pub mod permissions;
+mod read_nudge;
 pub mod rewrite_cmd;
 pub mod trust;
 pub mod verify_cmd;
