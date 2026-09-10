@@ -912,6 +912,9 @@ enum Commands {
         #[command(subcommand)]
         command: HookCommands,
     },
+
+    /// Run the MCP server over stdio (tools: ctx_batch_execute, ctx_search)
+    Mcp,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2715,6 +2718,8 @@ fn run_cli() -> Result<i32> {
                 }
             }
         },
+
+        Commands::Mcp => cmds::mcp::run()?,
 
         Commands::Rewrite { args } => {
             let cmd = args.join(" ");
