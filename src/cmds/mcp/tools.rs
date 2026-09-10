@@ -65,6 +65,8 @@ pub struct SearchInput {
     pub queries: Vec<String>,
     /// Sections returned per query. Defaults to 5, capped at 20.
     pub limit: Option<usize>,
+    /// Only sections from this source label, e.g. `fetch:<label>` or `execute:shell`.
+    pub source: Option<String>,
 }
 
 /// What one command produced.
@@ -346,10 +348,11 @@ pub(super) fn query_block(
     renderer: &mut Renderer,
     query: &str,
     limit: usize,
+    source: Option<&str>,
     out: &mut String,
 ) -> Result<usize> {
     out.push_str(&format!("## {query}\n"));
-    let sections = store.search(query, limit)?;
+    let sections = store.search(query, limit, source)?;
     if sections.is_empty() {
         out.push_str("No matching sections found.\n");
     }
@@ -370,11 +373,12 @@ fn query_blocks(
     renderer: &mut Renderer,
     queries: &[String],
     limit: usize,
+    source: Option<&str>,
     out: &mut String,
 ) -> Result<()> {
     let mut omitted = 0;
     for query in queries {
-        omitted += query_block(store, renderer, query, limit, out)?;
+        omitted += query_block(store, renderer, query, limit, source, out)?;
     }
     if omitted > 0 {
         out.push_str(&format!(
@@ -440,6 +444,7 @@ fn render_batch(store: &Store, input: &BatchExecuteInput, captured: &[Captured])
         &mut renderer,
         &input.queries,
         DEFAULT_SECTION_LIMIT,
+        None,
         &mut out,
     )?;
     Ok(out)
@@ -452,11 +457,17 @@ pub fn search(input: SearchInput) -> Result<String> {
         &store,
         &input.queries,
         input.limit.unwrap_or(DEFAULT_SECTION_LIMIT),
+        input.source.as_deref(),
     )
 }
 
-/// `ctx_search` against `store`.
-pub fn search_in(store: &Store, queries: &[String], limit: usize) -> Result<String> {
+/// `ctx_search` against `store`, optionally within one source label.
+pub fn search_in(
+    store: &Store,
+    queries: &[String],
+    limit: usize,
+    source: Option<&str>,
+) -> Result<String> {
     let mut renderer = Renderer::default();
     let mut out = String::new();
     query_blocks(
@@ -464,6 +475,7 @@ pub fn search_in(store: &Store, queries: &[String], limit: usize) -> Result<Stri
         &mut renderer,
         queries,
         limit.min(MAX_SEARCH_LIMIT),
+        source,
         &mut out,
     )?;
     Ok(out)
@@ -547,7 +559,7 @@ mod tests {
         render_batch(&store, &input, &captured).unwrap();
 
         let queries = ["alpha".to_string(), "gamma".to_string()];
-        let out = search_in(&store, &queries, DEFAULT_SECTION_LIMIT).unwrap();
+        let out = search_in(&store, &queries, DEFAULT_SECTION_LIMIT, None).unwrap();
 
         // Two queries x two identical chunks: the body once, a back-reference on
         // each of the other three hits, and a header for both sources.
@@ -616,11 +628,17 @@ mod tests {
         assert_eq!((again.chunks, again.skipped), (1, 1));
 
         // OR semantics: a question whose other words are absent still matches.
-        let out = search_in(&store, &["what does the build error say".to_string()], 5).unwrap();
+        let out = search_in(
+            &store,
+            &["what does the build error say".to_string()],
+            5,
+            None,
+        )
+        .unwrap();
         assert!(out.contains("the build error was fatal"), "{out}");
 
         // An unreachable limit is clamped, so one chunk cannot become 5000 rows.
-        let out = search_in(&store, &["error".to_string()], 5000).unwrap();
+        let out = search_in(&store, &["error".to_string()], 5000, None).unwrap();
         assert_eq!(out.matches("--- [build | ").count(), 1, "{out}");
     }
 }

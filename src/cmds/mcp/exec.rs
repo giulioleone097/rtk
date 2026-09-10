@@ -230,13 +230,12 @@ fn render(store: &Store, job: &Job, captured: &Captured, intent: Option<&str>) -
     out.push_str(&preview(&captured.text));
     out.push('\n');
     if let Some(intent) = intent {
-        // MERGE POINT (T3): once `tokenaut/fetch` is in, this block searches
-        // `job.source` only, through the `source` filter `query_block` gains.
         tools::query_block(
             store,
             &mut Renderer::default(),
             intent,
             DEFAULT_SECTION_LIMIT,
+            Some(&job.source),
             &mut out,
         )?;
     }

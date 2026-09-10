@@ -1,6 +1,7 @@
 //! `tokenaut mcp`: an MCP server over stdio exposing the context tools.
 
 mod exec;
+mod fetch;
 mod store;
 mod tools;
 
@@ -11,6 +12,7 @@ use rmcp::transport::stdio;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
 
 use exec::{ExecuteFileInput, ExecuteInput};
+use fetch::FetchInput;
 use tools::{BatchExecuteInput, SearchInput};
 
 /// Stateless handler: every tool call opens its own index connection.
@@ -46,10 +48,16 @@ impl ContextServer {
         text_result(exec::execute_file(input).await)
     }
 
-    // MERGE POINT (T3): `ctx_fetch_and_index` is registered here once
-    // `tokenaut/fetch` is in, and `ctx_search` takes its `source` filter.
+    /// Fetch URLs with curl, convert HTML or JSON to text, index them under fetch:<label> and return a preview.
+    #[tool]
+    async fn ctx_fetch_and_index(
+        &self,
+        Parameters(input): Parameters<FetchInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        text_result(fetch::fetch_and_index(input))
+    }
 
-    /// Search the indexed command output, one section list per query.
+    /// Search everything indexed so far, one section list per query; `source` restricts to one label.
     #[tool]
     async fn ctx_search(
         &self,
@@ -68,8 +76,9 @@ impl ServerHandler for ContextServer {
                 "ctx_batch_execute runs shell commands in parallel, indexes their output \
                  and answers queries against that index; ctx_execute and ctx_execute_file \
                  run one shell, javascript or python script and return its output, indexing \
-                 it instead when it is large; ctx_search answers queries against everything \
-                 indexed so far. Content already shown earlier in a response is replaced by \
+                 it instead when it is large; ctx_fetch_and_index indexes web pages under \
+                 fetch:<label>; ctx_search answers queries against everything indexed so far, \
+                 optionally within one source label. Content already shown earlier in a response is replaced by \
                  a back-reference to where it first appeared.",
             )
     }
