@@ -1061,13 +1061,14 @@ fn rewrite_pipeline_final_stage(
     })
 }
 
-/// Consumers that only display the stream they are handed, whatever produced
-/// it. Neither splits its input into fields, so what changes when the producer
-/// is rewritten is what a human reads, never what a program computes.
+/// Consumers that only display the head of the stream they are handed. None of
+/// them splits its input into fields, so what changes when the producer is
+/// rewritten is what a human reads, never what a program computes.
 ///
-/// `less` and `more` are deliberately absent: a pager can never reach anything
-/// the RTK cap already dropped. `tail` is absent here because it depends on the
-/// producer, and is accepted only after a [`SUMMARY_PRODUCERS`] head.
+/// `tail`, `less` and `more` are deliberately absent: an RTK filter emits a
+/// capped or regrouped view, so `git log | tail -5` would show the end of the
+/// 10 newest commits instead of the oldest commits the raw pipeline prints, and
+/// a pager can never reach anything the cap already dropped.
 ///
 /// ceiling: `head -N` after a rewrite reads the first N lines of the RTK view
 /// (header plus capped matches), so it shows fewer than N matches; and RTK
@@ -1076,58 +1077,16 @@ fn rewrite_pipeline_final_stage(
 /// the producer filter's cap and stream the filtered output.
 const DISPLAY_ONLY_CONSUMERS: &[&str] = &["head", "cat"];
 
-/// Producer heads whose RTK filter summarises the whole run — a test runner or
-/// a build — instead of emitting a capped view of a list. Only after one of
-/// these is `tail` a display-only consumer: the last lines of a summary are the
-/// verdict the raw `| tail -50` was asking for, while the tail of a capped list
-/// view is not the tail of the raw output (`git log | tail -5` would show the
-/// end of the 10 newest commits instead of the oldest commits the raw pipeline
-/// prints). Every head here was checked to have a filter with `rtk hook check
-/// "<head>"`; `pnpm test`, `npm test`, `yarn test` and `dotnet test` have none,
-/// so they are not listed and their pipelines stay raw.
-///
-/// ceiling: a hand-maintained list, so a summarising filter added to `rules.rs`
-/// later does not enable `tail` until someone adds it here. Upgrade trigger: a
-/// `summary_filter` flag on `RtkRule` read through the rule the producer
-/// matches — the existing `pipeline_final_safe` cannot serve, it means "safe as
-/// the last stage", not "summarises its input".
-const SUMMARY_PRODUCERS: &[&str] = &[
-    "cargo test",
-    "cargo build",
-    "cargo clippy",
-    "cargo check",
-    "npx jest",
-    "npx vitest",
-    "npx playwright test",
-    "jest",
-    "vitest",
-    "playwright test",
-    "pytest",
-    "go test",
-    "bun test",
-];
-
-/// Whether `producer` starts with a [`SUMMARY_PRODUCERS`] head. Matched on whole
-/// words, so `pytest-watch x` is not `pytest` and `npx jest x` needs the two-word
-/// head rather than the bare `jest` one.
-fn producer_emits_summary(producer: &str) -> bool {
-    SUMMARY_PRODUCERS.iter().any(|head| {
-        let mut words = producer.split_whitespace();
-        head.split_whitespace()
-            .all(|expected| words.next() == Some(expected))
-    })
-}
-
-/// A display-only stage invoked with nothing but flags and counts (`head -5`,
-/// `head -n 20`, `cat`, and `tail -30` when `tail_allowed`). A bare word operand
-/// disqualifies the stage: `cat file` reads that file instead of the pipe, and
-/// any other word could be a command in disguise.
-fn is_display_only_consumer(stage: &str, tail_allowed: bool) -> bool {
+/// A [`DISPLAY_ONLY_CONSUMERS`] stage invoked with nothing but flags and counts
+/// (`head -5`, `head -n 20`, `cat`). A bare word operand disqualifies the stage:
+/// `cat file` reads that file instead of the pipe, and any other word could be a
+/// command in disguise.
+fn is_display_only_consumer(stage: &str) -> bool {
     let mut words = stage.split_whitespace();
     let Some(name) = words.next() else {
         return false;
     };
-    (DISPLAY_ONLY_CONSUMERS.contains(&name) || (tail_allowed && name == "tail"))
+    DISPLAY_ONLY_CONSUMERS.contains(&name)
         && words.all(|word| word.starts_with('-') || word.chars().all(|c| c.is_ascii_digit()))
 }
 
@@ -1139,8 +1098,8 @@ fn is_display_only_consumer(stage: &str, tail_allowed: bool) -> bool {
 /// as `producer` alone.
 ///
 /// v0.48.0 keeps the producer raw before every consumer (commits b3936b8 and
-/// 590445e); this fork rewrites it before `head` and `cat`, and before `tail`
-/// when the producer is a [`SUMMARY_PRODUCERS`] head. Consumer stages are copied
+/// 590445e); this fork rewrites it before `head` and `cat` only. Consumer stages
+/// are copied
 /// byte-for-byte, and one stage outside the set anywhere in the pipeline keeps
 /// the general raw-producer contract for the whole pipeline.
 fn rewrite_producer_before_display_only_sinks(
@@ -1153,8 +1112,6 @@ fn rewrite_producer_before_display_only_sinks(
     transparent_prefixes: &[String],
 ) -> Option<String> {
     let end_offset = analysis.end_offset;
-    let producer = cmd[seg_start..first_pipe_offset].trim();
-    let tail_allowed = producer_emits_summary(producer);
     let mut stage_start: Option<usize> = None;
     for token in tokens {
         if token.offset < first_pipe_offset || token.offset >= end_offset {
@@ -1168,7 +1125,7 @@ fn rewrite_producer_before_display_only_sinks(
             return None;
         }
         if let Some(start) = stage_start {
-            if !is_display_only_consumer(cmd[start..token.offset].trim(), tail_allowed) {
+            if !is_display_only_consumer(cmd[start..token.offset].trim()) {
                 return None;
             }
         }
@@ -1176,10 +1133,11 @@ fn rewrite_producer_before_display_only_sinks(
     }
 
     let last_stage_start = stage_start?;
-    if !is_display_only_consumer(cmd[last_stage_start..end_offset].trim(), tail_allowed) {
+    if !is_display_only_consumer(cmd[last_stage_start..end_offset].trim()) {
         return None;
     }
 
+    let producer = cmd[seg_start..first_pipe_offset].trim();
     let rewritten = rewrite_segment_inner(
         producer,
         excluded,
@@ -2902,7 +2860,10 @@ mod tests {
 
     #[test]
     fn test_rewrite_pipe_unsafe_final_stage_stays_raw() {
-        assert_eq!(rewrite_command_no_prefixes("cargo test | wc -l", &[]), None);
+        assert_eq!(
+            rewrite_command_no_prefixes("cargo test | tail -50", &[]),
+            None
+        );
         assert_eq!(
             rewrite_command_no_prefixes("find . | xargs grep TODO", &[]),
             None
@@ -5025,38 +4986,11 @@ mod tests {
         }
 
         #[test]
-        fn test_summary_producer_before_tail() {
-            // A test-runner filter reports on the whole run, so the last lines
-            // of the RTK view answer the same question `| tail -50` asked.
-            assert_eq!(
-                rewrite_command_no_prefixes("cargo test | tail -50", &[]),
-                Some("rtk cargo test | tail -50".into())
-            );
-            assert_eq!(
-                rewrite_command_no_prefixes("npx jest x.test.ts 2>&1 | tail -30", &[]),
-                Some("rtk jest x.test.ts 2>&1 | tail -30".into())
-            );
-        }
-
-        #[test]
         fn test_truncating_consumer_stays_raw() {
-            // A list view is capped and regrouped, so its tail is not the tail
+            // An RTK view is capped and regrouped, so its tail is not the tail
             // of the raw output; a pager cannot reach past the cap either.
             assert_eq!(rewrite_command_no_prefixes("git log | tail -5", &[]), None);
-            assert_eq!(
-                rewrite_command_no_prefixes("grep -n foo x | tail -5", &[]),
-                None
-            );
             assert_eq!(rewrite_command_no_prefixes("git log | less", &[]), None);
-        }
-
-        #[test]
-        fn test_tail_with_file_operand_stays_raw() {
-            // `tail -50 build.log` reads the file, not the pipe.
-            assert_eq!(
-                rewrite_command_no_prefixes("cargo test | tail -50 build.log", &[]),
-                None
-            );
         }
 
         #[test]
