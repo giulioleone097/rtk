@@ -173,21 +173,54 @@ fn chunk(text: &str) -> Vec<String> {
     chunks
 }
 
-/// Cut `text` into pieces of at most [`MAX_CHUNK_CHARS`] characters.
+/// Cut `text` into pieces of at most [`MAX_CHUNK_CHARS`] characters, breaking
+/// at the last newline (else the last space) before the limit so no word is
+/// split across two chunks and lost to the search; a run with no break at all
+/// is cut hard at the limit.
 fn split_at_limit(text: &str) -> Vec<&str> {
     let mut pieces = Vec::new();
-    let mut start = 0;
-    let mut seen = 0;
-    for (idx, _) in text.char_indices() {
-        if seen == MAX_CHUNK_CHARS {
-            pieces.push(&text[start..idx]);
-            start = idx;
-            seen = 0;
+    let mut rest = text;
+    loop {
+        let Some((limit, _)) = rest.char_indices().nth(MAX_CHUNK_CHARS) else {
+            if !rest.is_empty() {
+                pieces.push(rest);
+            }
+            return pieces;
+        };
+        let window = &rest[..limit];
+        let cut = window
+            .rfind('\n')
+            .or_else(|| window.rfind(' '))
+            .filter(|&at| at > 0)
+            .unwrap_or(limit);
+        let piece = rest[..cut].trim_end();
+        if !piece.is_empty() {
+            pieces.push(piece);
         }
-        seen += 1;
+        rest = rest[cut..].trim_start_matches(['\n', ' ']);
     }
-    if start < text.len() {
-        pieces.push(&text[start..]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_paragraphs_are_cut_on_line_boundaries() {
+        let mut text = String::new();
+        for i in 1..=800 {
+            text.push_str(&format!("filler line {i} padding padding\n"));
+        }
+        text.push_str("the needle is here");
+        let lines: std::collections::HashSet<&str> = text.lines().collect();
+        let chunks = chunk(&text);
+        assert!(chunks.len() > 1);
+        for piece in &chunks {
+            assert!(piece.chars().count() <= MAX_CHUNK_CHARS);
+            for line in piece.lines() {
+                assert!(lines.contains(line), "split mid-line: {line:?}");
+            }
+        }
+        assert!(chunks.last().unwrap().contains("the needle is here"));
     }
-    pieces
 }
