@@ -13,10 +13,10 @@ use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Semaphore;
 
-use super::store::{Section, Store};
+use super::store::{Indexed, Section, Store};
 
 /// Per-command timeout when the caller does not set one.
-const DEFAULT_TIMEOUT_MS: u64 = 60_000;
+pub(super) const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 /// Commands running at once; the rest wait for a slot.
 const MAX_PARALLEL_COMMANDS: usize = 8;
 /// Upper bound on the output captured from a single command.
@@ -29,7 +29,7 @@ const PREVIEW_LINES: usize = 10;
 /// megabyte, and this response is what the caller pays for.
 const PREVIEW_BYTES: usize = 2048;
 /// Sections per query when the caller does not ask for a different number.
-const DEFAULT_SECTION_LIMIT: usize = 5;
+pub(super) const DEFAULT_SECTION_LIMIT: usize = 5;
 /// Highest limit a caller can ask for.
 const MAX_SEARCH_LIMIT: usize = 20;
 /// Once a response passes this size no further section is added.
@@ -68,19 +68,19 @@ pub struct SearchInput {
 }
 
 /// What one command produced.
-struct Captured {
-    exit: i32,
+pub(super) struct Captured {
+    pub exit: i32,
     /// Interleaved stdout and stderr, capped at [`MAX_CAPTURE_BYTES`].
-    text: String,
+    pub text: String,
     /// Raw bytes read from the command, before any lossy decoding.
-    bytes: usize,
+    pub bytes: usize,
     /// The command had more to say than the cap allowed.
-    truncated: bool,
+    pub truncated: bool,
 }
 
 impl Captured {
     /// A command that never ran.
-    fn failed(text: String) -> Self {
+    pub(super) fn failed(text: String) -> Self {
         Captured {
             exit: -1,
             text,
@@ -138,19 +138,52 @@ fn kill_group(pid: Option<u32>) {
 /// twice, and the inner shell's own diagnostics are redirected as well.
 const MERGE_STREAMS: &str = r#"sh -c "$1" 2>&1"#;
 
-/// Run `command` with `sh -c`, streaming its output under the capture cap.
+/// One command line plus the environment its interpreter needs. `ctx_execute`
+/// runs a script the caller wrote, so it strips the variables that would make
+/// an interpreter run something else first and adds the ones the script reads.
+pub(super) struct Launch {
+    /// Command line, run with `sh -c`.
+    pub command: String,
+    /// Variables removed from the child environment.
+    pub remove_env: &'static [&'static str],
+    /// Variables added to it.
+    pub set_env: Vec<(&'static str, String)>,
+}
+
+impl Launch {
+    /// A command run with the server's own environment.
+    fn plain(command: String) -> Self {
+        Launch {
+            command,
+            remove_env: &[],
+            set_env: Vec::new(),
+        }
+    }
+}
+
+/// Run `launch` with `sh -c`, streaming its output under the capture cap.
 /// Never fails: a spawn error, a cap or a timeout is reported as output.
-async fn run_command(command: String, cwd: Option<PathBuf>, timeout: Duration) -> Captured {
+pub(super) async fn run_command(
+    launch: Launch,
+    cwd: Option<PathBuf>,
+    timeout: Duration,
+) -> Captured {
     let mut builder = tokio::process::Command::new("sh");
     builder
         .arg("-c")
         .arg(MERGE_STREAMS)
         .arg("tokenaut")
-        .arg(&command)
+        .arg(&launch.command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    for name in launch.remove_env {
+        builder.env_remove(name);
+    }
+    for (name, value) in &launch.set_env {
+        builder.env(name, value);
+    }
     if let Some(dir) = &cwd {
         builder.current_dir(dir);
     }
@@ -225,7 +258,7 @@ fn truncate_to_cap(mut text: String) -> String {
 /// back-reference; a chunk keeps its `--- [source | ts] ---` header so the
 /// reader still sees every source holding that text.
 #[derive(Default)]
-struct Renderer {
+pub(super) struct Renderer {
     /// Full captured output -> the command label that rendered its head first.
     heads: HashMap<String, String>,
     /// Chunk content -> the query that rendered it first.
@@ -288,9 +321,27 @@ fn remember(seen: &mut HashMap<String, String>, body: &str, name: &str) -> Optio
     }
 }
 
+/// The line a capture is reported by: what it exited with, how much it wrote,
+/// and — when the output was indexed instead of returned — what that produced.
+pub(super) fn summary(captured: &Captured, indexed: Option<&Indexed>) -> String {
+    let mut line = format!("exit {}, {} bytes", captured.exit, captured.bytes);
+    if captured.truncated {
+        // The notice sits at the end of the captured text, past the head.
+        line.push_str(" (truncated at 1 MB)");
+    }
+    if let Some(indexed) = indexed {
+        line.push_str(&format!(", {} chunks", indexed.chunks));
+        if indexed.skipped > 0 {
+            line.push_str(&format!(" ({} already indexed)", indexed.skipped));
+        }
+    }
+    line.push('\n');
+    line
+}
+
 /// Append the `## <query>` block for one query. Returns the sections left out
 /// because the response is already at [`MAX_RESPONSE_BYTES`].
-fn query_block(
+pub(super) fn query_block(
     store: &Store,
     renderer: &mut Renderer,
     query: &str,
@@ -361,7 +412,7 @@ async fn run_all(
             tokio::spawn(async move {
                 // The timeout starts once the command does, not while it waits.
                 let _slot = slots.acquire().await.expect("the semaphore stays open");
-                run_command(command, cwd, timeout).await
+                run_command(Launch::plain(command), cwd, timeout).await
             })
         })
         .collect();
@@ -379,16 +430,7 @@ fn render_batch(store: &Store, input: &BatchExecuteInput, captured: &[Captured])
     for (spec, result) in input.commands.iter().zip(captured) {
         let indexed = store.index(&spec.label, &result.text)?;
         out.push_str(&format!("### {}\n", spec.label));
-        out.push_str(&format!("exit {}, {} bytes", result.exit, result.bytes));
-        if result.truncated {
-            // The notice sits at the end of the captured text, past the head.
-            out.push_str(" (truncated at 1 MB)");
-        }
-        out.push_str(&format!(", {} chunks", indexed.chunks));
-        if indexed.skipped > 0 {
-            out.push_str(&format!(" ({} already indexed)", indexed.skipped));
-        }
-        out.push('\n');
+        out.push_str(&summary(result, Some(&indexed)));
         out.push_str(&renderer.head(&spec.label, &result.text));
         out.push('\n');
     }
