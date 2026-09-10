@@ -54,7 +54,12 @@ impl ContextServer {
         &self,
         Parameters(input): Parameters<FetchInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        text_result(fetch::fetch_and_index(input))
+        // Blocking: curl and the index run off the reactor so a slow host does
+        // not stall the server's other calls.
+        let fetched = tokio::task::spawn_blocking(move || fetch::fetch_and_index(input))
+            .await
+            .map_err(|err| ErrorData::internal_error(format!("fetch task: {err}"), None))?;
+        text_result(fetched)
     }
 
     /// Search everything indexed so far, one section list per query; `source` restricts to one label.

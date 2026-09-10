@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 
 /// Upper bound, in characters, of an indexed chunk.
 const MAX_CHUNK_CHARS: usize = 1500;
+/// Schema of the index. Bumped whenever the tables change shape.
+const SCHEMA_VERSION: i64 = 1;
 
 /// What one call to [`Store::index`] wrote.
 pub struct Indexed {
@@ -39,18 +41,26 @@ impl Store {
         Self::open(&dir.join("index.sqlite"))
     }
 
-    /// Open (creating if missing) the index at `path`.
+    /// Open (creating if missing) the index at `path`. `source` is UNINDEXED so
+    /// a query that happens to equal a label matches only real content.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
-        conn.execute_batch(
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < SCHEMA_VERSION {
+            // The index is a cache of fetched and executed output: rebuilding
+            // it costs one re-run, so an older schema is dropped, not migrated.
+            conn.execute_batch("DROP TABLE IF EXISTS chunks; DROP TABLE IF EXISTS chunk_keys;")?;
+        }
+        conn.execute_batch(&format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
-                 source,
+                 source UNINDEXED,
                  content,
                  ts UNINDEXED,
                  tokenize = 'unicode61'
              );
-             CREATE TABLE IF NOT EXISTS chunk_keys (key TEXT PRIMARY KEY);",
-        )?;
+             CREATE TABLE IF NOT EXISTS chunk_keys (key TEXT PRIMARY KEY);
+             PRAGMA user_version = {SCHEMA_VERSION};"
+        ))?;
         Ok(Self { conn })
     }
 
@@ -89,40 +99,22 @@ impl Store {
         if expr.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = match source {
-            Some(source) => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT source, content, ts FROM chunks WHERE chunks MATCH ?1 AND source = ?2
-                     ORDER BY bm25(chunks), rowid LIMIT ?3",
-                )?;
-                let sections = stmt
-                    .query_map((expr, source, limit), row_to_section)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                sections
-            }
-            None => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT source, content, ts FROM chunks WHERE chunks MATCH ?1
-                     ORDER BY bm25(chunks), rowid LIMIT ?2",
-                )?;
-                let sections = stmt
-                    .query_map((expr, limit), row_to_section)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                sections
-            }
-        };
-        Ok(rows)
+        let mut stmt = self.conn.prepare(
+            "SELECT source, content, ts FROM chunks
+             WHERE chunks MATCH ?1 AND (?2 IS NULL OR source = ?2)
+             ORDER BY bm25(chunks), rowid LIMIT ?3",
+        )?;
+        let sections = stmt
+            .query_map((expr, source, limit), |row| {
+                Ok(Section {
+                    source: row.get(0)?,
+                    content: row.get(1)?,
+                    ts: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(sections)
     }
-}
-
-/// Map one `chunks` row to a [`Section`], shared by both branches of
-/// [`Store::search`].
-fn row_to_section(row: &rusqlite::Row) -> rusqlite::Result<Section> {
-    Ok(Section {
-        source: row.get(0)?,
-        content: row.get(1)?,
-        ts: row.get(2)?,
-    })
 }
 
 /// Quote every term so client punctuation cannot be read as FTS5 syntax, and
@@ -174,9 +166,9 @@ fn chunk(text: &str) -> Vec<String> {
 }
 
 /// Cut `text` into pieces of at most [`MAX_CHUNK_CHARS`] characters, breaking
-/// at the last newline (else the last space) before the limit so no word is
-/// split across two chunks and lost to the search; a run with no break at all
-/// is cut hard at the limit.
+/// at the last newline (else the last whitespace of any kind, a non-breaking
+/// space included) before the limit so no word is split across two chunks and
+/// lost to the search; a run with no break at all is cut hard at the limit.
 fn split_at_limit(text: &str) -> Vec<&str> {
     let mut pieces = Vec::new();
     let mut rest = text;
@@ -190,14 +182,14 @@ fn split_at_limit(text: &str) -> Vec<&str> {
         let window = &rest[..limit];
         let cut = window
             .rfind('\n')
-            .or_else(|| window.rfind(' '))
+            .or_else(|| window.rfind(char::is_whitespace))
             .filter(|&at| at > 0)
             .unwrap_or(limit);
         let piece = rest[..cut].trim_end();
         if !piece.is_empty() {
             pieces.push(piece);
         }
-        rest = rest[cut..].trim_start_matches(['\n', ' ']);
+        rest = rest[cut..].trim_start_matches(char::is_whitespace);
     }
 }
 
@@ -222,5 +214,70 @@ mod tests {
             }
         }
         assert!(chunks.last().unwrap().contains("the needle is here"));
+    }
+
+    #[test]
+    fn paragraphs_are_cut_on_any_whitespace() {
+        // Separated by non-breaking spaces only: no '\n' and no ' ' to break
+        // on. The word is seven characters with its separator, so the hard cut
+        // at MAX_CHUNK_CHARS lands inside a word rather than between two.
+        let mut text = String::new();
+        while text.chars().count() < MAX_CHUNK_CHARS + 200 {
+            text.push_str("alphas\u{a0}");
+        }
+        let chunks = chunk(&text);
+        assert!(chunks.len() > 1);
+        for piece in &chunks {
+            for word in piece.split(char::is_whitespace).filter(|w| !w.is_empty()) {
+                assert_eq!(word, "alphas", "split mid-word: {word:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_query_equal_to_a_label_matches_no_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("index.sqlite")).unwrap();
+        store
+            .index("fetch:zebra", "content without that word")
+            .unwrap();
+
+        assert!(store.search("zebra", 10, None).unwrap().is_empty());
+        assert_eq!(
+            store
+                .search("content", 10, Some("fetch:zebra"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_index_from_the_previous_schema_is_rebuilt_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE VIRTUAL TABLE chunks USING fts5(
+                 source,
+                 content,
+                 ts UNINDEXED,
+                 tokenize = 'unicode61'
+             );
+             CREATE TABLE chunk_keys (key TEXT PRIMARY KEY);
+             INSERT INTO chunks(source, content, ts)
+                 VALUES ('fetch:zebra', 'stale row', '2020-01-01T00:00:00+00:00');",
+        )
+        .unwrap();
+        drop(old);
+
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(store.search("stale", 10, None).unwrap().is_empty());
+        assert!(store.search("zebra", 10, None).unwrap().is_empty());
     }
 }

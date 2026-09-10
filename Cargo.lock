@@ -1518,6 +1518,7 @@ dependencies = [
  "tokio",
  "toml",
  "ureq",
+ "url",
  "walkdir",
  "which",
  "windows-sys 0.59.0",
