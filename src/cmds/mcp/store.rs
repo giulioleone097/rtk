@@ -82,24 +82,47 @@ impl Store {
 
     /// The `limit` best chunks for `query`, ranked by bm25. `rowid` breaks ties so
     /// two identical queries in one response rank the same rows the same way.
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Section>> {
+    /// `source`, when set, restricts the match to chunks indexed under that
+    /// exact source.
+    pub fn search(&self, query: &str, limit: usize, source: Option<&str>) -> Result<Vec<Section>> {
         let expr = fts_query(query);
         if expr.is_empty() {
             return Ok(Vec::new());
         }
-        let mut stmt = self.conn.prepare(
-            "SELECT source, content, ts FROM chunks WHERE chunks MATCH ?1
-             ORDER BY bm25(chunks), rowid LIMIT ?2",
-        )?;
-        let rows = stmt.query_map((expr, limit), |row| {
-            Ok(Section {
-                source: row.get(0)?,
-                content: row.get(1)?,
-                ts: row.get(2)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let rows = match source {
+            Some(source) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT source, content, ts FROM chunks WHERE chunks MATCH ?1 AND source = ?2
+                     ORDER BY bm25(chunks), rowid LIMIT ?3",
+                )?;
+                let sections = stmt
+                    .query_map((expr, source, limit), row_to_section)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                sections
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT source, content, ts FROM chunks WHERE chunks MATCH ?1
+                     ORDER BY bm25(chunks), rowid LIMIT ?2",
+                )?;
+                let sections = stmt
+                    .query_map((expr, limit), row_to_section)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                sections
+            }
+        };
+        Ok(rows)
     }
+}
+
+/// Map one `chunks` row to a [`Section`], shared by both branches of
+/// [`Store::search`].
+fn row_to_section(row: &rusqlite::Row) -> rusqlite::Result<Section> {
+    Ok(Section {
+        source: row.get(0)?,
+        content: row.get(1)?,
+        ts: row.get(2)?,
+    })
 }
 
 /// Quote every term so client punctuation cannot be read as FTS5 syntax, and

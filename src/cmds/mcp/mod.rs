@@ -1,5 +1,6 @@
 //! `tokenaut mcp`: an MCP server over stdio exposing the context tools.
 
+pub mod fetch;
 mod store;
 mod tools;
 

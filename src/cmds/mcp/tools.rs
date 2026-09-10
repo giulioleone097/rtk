@@ -298,7 +298,7 @@ fn query_block(
     out: &mut String,
 ) -> Result<usize> {
     out.push_str(&format!("## {query}\n"));
-    let sections = store.search(query, limit)?;
+    let sections = store.search(query, limit, None)?;
     if sections.is_empty() {
         out.push_str("No matching sections found.\n");
     }
