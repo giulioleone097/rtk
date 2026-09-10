@@ -1,6 +1,7 @@
 //! Tool inputs, command execution and response rendering for `tokenaut mcp`.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -34,6 +35,11 @@ pub(super) const DEFAULT_SECTION_LIMIT: usize = 5;
 const MAX_SEARCH_LIMIT: usize = 20;
 /// Once a response passes this size no further section is added.
 const MAX_RESPONSE_BYTES: usize = 40 * 1024;
+
+/// The timeout one call runs under: what the caller asked for, or the default.
+pub(super) fn timeout_of(timeout_ms: Option<u64>) -> Duration {
+    Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS))
+}
 
 /// One shell command to run and index.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -134,10 +140,12 @@ fn kill_group(pid: Option<u32>) {
 }
 
 /// Wrapper script: the caller's command runs in an inner shell whose stderr is
-/// redirected into the outer shell's stdout, so both streams reach us in the
-/// order they were written and a failure reason lands next to the output that
-/// led to it. The command travels as an argument, so nothing in it is parsed
-/// twice, and the inner shell's own diagnostics are redirected as well.
+/// redirected into the outer shell's stdout, so a failure reason lands next to
+/// the output that led to it, in the order the child wrote the two. An
+/// interpreter that block-buffers stdout to a pipe — python above all — still
+/// flushes it after its unbuffered stderr, and then the two arrive out of
+/// order. The command travels as an argument, so nothing in it is parsed twice,
+/// and the inner shell's own diagnostics are redirected as well.
 const MERGE_STREAMS: &str = r#"sh -c "$1" 2>&1"#;
 
 /// One command line plus the environment its interpreter needs. `ctx_execute`
@@ -147,7 +155,7 @@ pub(super) struct Launch {
     /// Command line, run with `sh -c`.
     pub command: String,
     /// Variables removed from the child environment.
-    pub remove_env: &'static [&'static str],
+    pub remove_env: Vec<OsString>,
     /// Variables added to it.
     pub set_env: Vec<(&'static str, String)>,
 }
@@ -157,9 +165,29 @@ impl Launch {
     fn plain(command: String) -> Self {
         Launch {
             command,
-            remove_env: &[],
+            remove_env: Vec::new(),
             set_env: Vec::new(),
         }
+    }
+}
+
+/// Kills the process group unless the call disarms it first. `kill_on_drop`
+/// reaches the direct child only, so a call dropped mid-flight — the client
+/// closed stdin and cancelled it — would leave the rest of the group running;
+/// this takes the group down on every path out, cancellation included.
+struct GroupGuard(Option<u32>);
+
+impl GroupGuard {
+    /// The group is down and the child reaped, so its pid must not be signalled
+    /// again: by then it can name another process.
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        kill_group(self.0);
     }
 }
 
@@ -180,7 +208,7 @@ pub(super) async fn run_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    for name in launch.remove_env {
+    for name in &launch.remove_env {
         builder.env_remove(name);
     }
     for (name, value) in &launch.set_env {
@@ -197,6 +225,8 @@ pub(super) async fn run_command(
         Err(err) => return Captured::failed(format!("failed to spawn: {err}")),
     };
     let pid = child.id();
+    // From here on the group goes down on every exit, cancellation included.
+    let group = GroupGuard(pid);
     let stdout = child.stdout.take().expect("stdout is piped");
     // The reader runs as a task so a timeout keeps whatever it already read.
     let reading = tokio::spawn(read_capped(stdout, MAX_CAPTURE_BYTES, pid));
@@ -211,6 +241,7 @@ pub(super) async fn run_command(
     kill_group(pid);
     let _ = child.start_kill();
     let _ = child.wait().await;
+    group.disarm();
 
     let (out, capped) = reading.await.unwrap_or_default();
     let bytes = out.len();
@@ -244,13 +275,7 @@ fn exit_code(status: &ExitStatus) -> i32 {
 
 /// Cut `text` down to [`MAX_CAPTURE_BYTES`] on a character boundary.
 fn truncate_to_cap(mut text: String) -> String {
-    if text.len() <= MAX_CAPTURE_BYTES {
-        return text;
-    }
-    let mut end = MAX_CAPTURE_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = cut_at(&text, MAX_CAPTURE_BYTES).len();
     text.truncate(end);
     text
 }
@@ -265,6 +290,8 @@ pub(super) struct Renderer {
     heads: HashMap<String, String>,
     /// Chunk content -> the query that rendered it first.
     chunks: HashMap<String, String>,
+    /// Text printed outside any section -> what it was called there.
+    printed: Vec<(String, String)>,
 }
 
 impl Renderer {
@@ -277,13 +304,46 @@ impl Renderer {
         }
     }
 
+    /// Record text this response prints before its sections, so a chunk lying
+    /// inside it is answered by a back-reference instead of a second copy.
+    pub(super) fn shown(&mut self, label: &str, text: &str) {
+        self.printed.push((label.to_string(), text.to_string()));
+    }
+
     fn section(&mut self, query: &str, section: &Section) -> String {
         let header = format!("--- [{} | {}] ---\n", section.source, section.ts);
-        match remember(&mut self.chunks, &section.content, query) {
+        let first = self
+            .already_printed(&section.content)
+            .or_else(|| remember(&mut self.chunks, &section.content, query));
+        match first {
             Some(first) => format!("{header}(already shown above under \"{first}\")\n"),
             None => format!("{header}{}\n", section.content),
         }
     }
+
+    /// What `content` was called where this response already carries it whole.
+    fn already_printed(&self, content: &str) -> Option<String> {
+        let body = content.trim_end();
+        if body.is_empty() {
+            return None;
+        }
+        self.printed
+            .iter()
+            .find(|(_, text)| text.contains(body))
+            .map(|(label, _)| label.clone())
+    }
+}
+
+/// `text` cut down to at most `limit` bytes, on a character boundary.
+pub(super) fn cut_at(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// The first [`PREVIEW_LINES`] lines of `text`, cut at [`PREVIEW_BYTES`].
@@ -292,11 +352,7 @@ fn head_preview(text: &str) -> String {
     for line in text.lines().take(PREVIEW_LINES) {
         let room = PREVIEW_BYTES.saturating_sub(preview.len());
         if line.len() >= room {
-            let mut end = room;
-            while !line.is_char_boundary(end) {
-                end -= 1;
-            }
-            preview.push_str(&line[..end]);
+            preview.push_str(cut_at(line, room));
             preview.push_str("…\n");
             return preview;
         }
@@ -390,7 +446,7 @@ fn query_blocks(
 
 /// `ctx_batch_execute` against the default index.
 pub async fn batch_execute(input: BatchExecuteInput) -> Result<String> {
-    let timeout = Duration::from_millis(input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
+    let timeout = timeout_of(input.timeout_ms);
     let cwd = input.cwd.as_ref().map(PathBuf::from);
     let captured = run_all(&input.commands, cwd, timeout).await?;
     // The index connection is opened only once no await is left: it is not `Sync`,
@@ -605,6 +661,72 @@ mod tests {
         );
         // What the command managed to write before the timeout is reported.
         assert_eq!(captured[0].bytes, "EARLY\n".len());
+    }
+
+    /// Whether `pid` is still there; a negative `pid` asks about a whole group.
+    #[cfg(unix)]
+    fn alive(pid: i32) -> bool {
+        #[allow(unsafe_code)]
+        // nosemgrep: unsafe-block
+        unsafe {
+            libc::kill(pid, 0) == 0
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_pid(path: &std::path::Path) -> Option<i32> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    /// The client closing stdin cancels the call by dropping its future.
+    /// `kill_on_drop` would then reach the direct child alone and leave
+    /// everything it started running.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_call_takes_its_whole_process_group_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = dir.path().join("pgid");
+        let child = dir.path().join("kid");
+        let command = format!(
+            "ps -o pgid= -p $$ > '{}'; sleep 20 & echo $! > '{}'; wait",
+            group.display(),
+            child.display()
+        );
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut call = Box::pin(run_command(
+                    Launch::plain(command),
+                    None,
+                    Duration::from_secs(30),
+                ));
+                let mut started = None;
+                for _ in 0..250 {
+                    tokio::select! {
+                        _ = &mut call => panic!("the command returned on its own"),
+                        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                    }
+                    if let (Some(pgid), Some(kid)) = (read_pid(&group), read_pid(&child)) {
+                        started = Some((pgid, kid));
+                        break;
+                    }
+                }
+                let (pgid, kid) = started.expect("the command never started");
+
+                drop(call);
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while (alive(kid) || alive(-pgid)) && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert!(!alive(kid), "sleep {kid} survived the cancelled call");
+                assert!(
+                    !alive(-pgid),
+                    "process group {pgid} survived the cancelled call"
+                );
+            });
     }
 
     #[test]
