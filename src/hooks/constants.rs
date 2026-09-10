@@ -20,6 +20,9 @@ pub const VIBE_HOOK_COMMAND: &str = "tokenaut hook vibe";
 pub const CONFIG_DIR: &str = ".config";
 pub const OPENCODE_SUBDIR: &str = "opencode";
 pub const PLUGIN_SUBDIR: &str = "plugins";
+/// Where Claude Code unpacks installed plugins:
+/// `<config dir>/plugins/cache/<marketplace>/<plugin>/<version>/`.
+pub const PLUGIN_CACHE_SUBDIR: &str = "cache";
 pub const OPENCODE_PLUGIN_FILE: &str = "rtk.ts";
 
 pub const CURSOR_DIR: &str = ".cursor";

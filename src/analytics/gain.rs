@@ -126,7 +126,7 @@ pub fn run(
             hook_check::HookStatus::Missing => {
                 eprintln!(
                     "{}",
-                    "[warn] No hook installed — run `rtk init -g` for automatic token savings"
+                    "[warn] No hook installed — run `tokenaut init -g` for automatic token savings"
                         .yellow()
                 );
                 eprintln!();
@@ -134,7 +134,7 @@ pub fn run(
             hook_check::HookStatus::Outdated => {
                 eprintln!(
                     "{}",
-                    "[warn] Hook outdated — run `rtk init -g` to update".yellow()
+                    "[warn] Hook outdated — run `tokenaut init -g` to update".yellow()
                 );
                 eprintln!();
             }

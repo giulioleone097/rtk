@@ -120,23 +120,52 @@ fn cap(mut text: String) -> String {
     text
 }
 
-/// Renders search results. A chunk body already shown in the same response is
-/// replaced by a back-reference, but its `--- [source | ts] ---` header stays so
-/// the reader still sees every source holding that text.
+/// Renders one response body at most once. A per-command head or a chunk body
+/// already shown in the same response is replaced by a back-reference; a
+/// chunk keeps its `--- [source | ts] ---` header so the reader still sees every
+/// source holding that text.
 #[derive(Default)]
 struct Renderer {
-    /// Chunk content -> the first query that rendered it.
+    /// Body -> the command label or query that rendered it first.
     seen: HashMap<String, String>,
 }
 
 impl Renderer {
+    /// The [`PREVIEW_LINES`] head of one command's output, or a back-reference
+    /// when the same text was already rendered in this response.
+    fn head(&mut self, label: &str, text: &str) -> String {
+        let preview: String = text
+            .lines()
+            .take(PREVIEW_LINES)
+            .map(|line| format!("{line}\n"))
+            .collect();
+        match self.remember(&preview, label) {
+            Some(first) => format!("(same output as \"{first}\")\n"),
+            None => preview,
+        }
+    }
+
     fn section(&mut self, query: &str, section: &Section) -> String {
         let header = format!("--- [{} | {}] ---\n", section.source, section.ts);
-        match self.seen.get(&section.content) {
+        match self.remember(&section.content, query) {
             Some(first) => format!("{header}(already shown above for \"{first}\")\n"),
+            None => format!("{header}{}\n", section.content),
+        }
+    }
+
+    /// `Some(first)` when `body` was already rendered, otherwise records `name`
+    /// as its first renderer and returns `None`. Trailing blank lines are not
+    /// part of the identity: a head and the chunk cut from it match.
+    fn remember(&mut self, body: &str, name: &str) -> Option<String> {
+        let key = body.trim_end();
+        if key.is_empty() {
+            return None;
+        }
+        match self.seen.get(key) {
+            Some(first) => Some(first.clone()),
             None => {
-                self.seen.insert(section.content.clone(), query.to_string());
-                format!("{header}{}\n", section.content)
+                self.seen.insert(key.to_string(), name.to_string());
+                None
             }
         }
     }
@@ -188,6 +217,7 @@ async fn run_all(commands: &[CommandSpec], timeout: Duration) -> Result<Vec<Capt
 /// Index every capture and render the per-command blocks plus the query blocks.
 fn render_batch(store: &Store, input: &BatchExecuteInput, captured: &[Captured]) -> Result<String> {
     let mut out = String::new();
+    let mut renderer = Renderer::default();
     for (spec, result) in input.commands.iter().zip(captured) {
         let chunks = store.index(&spec.label, &result.text)?;
         out.push_str(&format!("### {}\n", spec.label));
@@ -195,14 +225,10 @@ fn render_batch(store: &Store, input: &BatchExecuteInput, captured: &[Captured])
             "exit {}, {} bytes, {} chunks\n",
             result.exit, result.bytes, chunks
         ));
-        for line in result.text.lines().take(PREVIEW_LINES) {
-            out.push_str(line);
-            out.push('\n');
-        }
+        out.push_str(&renderer.head(&spec.label, &result.text));
         out.push('\n');
     }
 
-    let mut renderer = Renderer::default();
     for query in &input.queries {
         query_block(store, &mut renderer, query, BATCH_QUERY_LIMIT, &mut out)?;
     }
@@ -240,6 +266,40 @@ mod tests {
         }
     }
 
+    fn capture(commands: &[CommandSpec]) -> Vec<Captured> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run_all(commands, Duration::from_millis(DEFAULT_TIMEOUT_MS)))
+            .unwrap()
+    }
+
+    #[test]
+    fn repeated_command_output_is_shown_once_per_response() {
+        let input = BatchExecuteInput {
+            commands: vec![spec("a"), spec("b")],
+            queries: vec!["alpha".to_string()],
+            timeout_ms: None,
+        };
+        let captured = capture(&input.commands);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("index.sqlite")).unwrap();
+        let out = render_batch(&store, &input, &captured).unwrap();
+
+        // Two identical commands and one query matching both chunks: the body
+        // appears once in the whole response, and the three other places that
+        // would repeat it point back at the head that showed it.
+        assert_eq!(out.matches("alpha beta\ngamma").count(), 1, "{out}");
+        assert_eq!(out.matches("(same output as \"a\")").count(), 1, "{out}");
+        assert_eq!(
+            out.matches("(already shown above for \"a\")").count(),
+            2,
+            "{out}"
+        );
+    }
+
     #[test]
     fn repeated_section_is_shown_once_per_response() {
         let input = BatchExecuteInput {
@@ -247,16 +307,7 @@ mod tests {
             queries: Vec::new(),
             timeout_ms: None,
         };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let captured = runtime
-            .block_on(run_all(
-                &input.commands,
-                Duration::from_millis(DEFAULT_TIMEOUT_MS),
-            ))
-            .unwrap();
+        let captured = capture(&input.commands);
 
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("index.sqlite")).unwrap();

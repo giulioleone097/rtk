@@ -1,11 +1,14 @@
 //! Detects whether RTK hooks are installed and warns if they are outdated.
 
-use super::constants::{HOOKS_SUBDIR, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON};
+use super::constants::{
+    HOOKS_JSON, HOOKS_SUBDIR, PLUGIN_CACHE_SUBDIR, PLUGIN_SUBDIR, PRE_TOOL_USE_KEY,
+    REWRITE_HOOK_FILE, SETTINGS_JSON,
+};
 use super::init::resolve_claude_dir;
 use super::is_claude_hook_command;
-use crate::core::constants::RTK_DATA_DIR;
+use crate::core::constants::{BIN, RTK_DATA_DIR};
 use crate::core::utils::from_json_str;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const CURRENT_HOOK_VERSION: u8 = 3;
 const WARN_INTERVAL_SECS: u64 = 24 * 3600;
@@ -36,7 +39,7 @@ pub fn status() -> HookStatus {
     // Check for new binary command in settings.json first
     if binary_hook_registered(&claude_dir) {
         // If old script file still exists alongside new command, report Outdated
-        // (migration not complete — user should run `rtk init -g` to clean up)
+        // (migration not complete — user should run `tokenaut init -g` to clean up)
         let old_hook = claude_dir.join(HOOKS_SUBDIR).join(REWRITE_HOOK_FILE);
         if old_hook.exists() {
             return HookStatus::Outdated;
@@ -58,10 +61,44 @@ pub fn status() -> HookStatus {
     }
 }
 
-/// Check if the native binary command is registered in settings.json
-fn binary_hook_registered(claude_dir: &std::path::Path) -> bool {
-    let settings_path = claude_dir.join(SETTINGS_JSON);
-    let content = match std::fs::read_to_string(&settings_path) {
+/// Check if the hook command is registered for Claude Code, either in
+/// `settings.json` or by an installed plugin.
+fn binary_hook_registered(claude_dir: &Path) -> bool {
+    declares_hook(&claude_dir.join(SETTINGS_JSON)) || plugin_hook_registered(claude_dir)
+}
+
+/// A plugin ships its hook in
+/// `<config dir>/plugins/cache/<marketplace>/<plugin>/<version>/hooks/hooks.json`,
+/// which Claude Code loads without ever touching `settings.json`.
+fn plugin_hook_registered(claude_dir: &Path) -> bool {
+    let cache = claude_dir.join(PLUGIN_SUBDIR).join(PLUGIN_CACHE_SUBDIR);
+    for marketplace in subdirs(&cache) {
+        for plugin in subdirs(&marketplace) {
+            for version in subdirs(&plugin) {
+                if declares_hook(&version.join(HOOKS_SUBDIR).join(HOOKS_JSON)) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn subdirs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
+/// True when the JSON file at `path` declares our hook command (in either the
+/// current or the legacy spelling) under `PreToolUse`.
+fn declares_hook(path: &Path) -> bool {
+    let content = match std::fs::read_to_string(path) {
         Ok(c) if !c.trim().is_empty() => c,
         _ => return false,
     };
@@ -69,16 +106,11 @@ fn binary_hook_registered(claude_dir: &std::path::Path) -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    let pre_tool_use = match root
-        .get("hooks")
+    root.get("hooks")
         .and_then(|h| h.get(PRE_TOOL_USE_KEY))
         .and_then(|p| p.as_array())
-    {
-        Some(arr) => arr,
-        None => return false,
-    };
-    pre_tool_use
-        .iter()
+        .into_iter()
+        .flatten()
         .filter_map(|entry| entry.get("hooks")?.as_array())
         .flatten()
         .filter_map(|hook| hook.get("command")?.as_str())
@@ -95,10 +127,12 @@ pub fn maybe_warn() {
 fn check_and_warn() -> Option<()> {
     let warning = match status() {
         HookStatus::Ok => return Some(()),
-        HookStatus::Missing => {
-            "[rtk] /!\\ No hook installed — run `rtk init -g` for automatic token savings"
+        HookStatus::Missing => format!(
+            "[{BIN}] /!\\ No hook installed — run `{BIN} init -g` for automatic token savings"
+        ),
+        HookStatus::Outdated => {
+            format!("[{BIN}] /!\\ Hook outdated — run `{BIN} init -g` to update")
         }
-        HookStatus::Outdated => "[rtk] /!\\ Hook outdated — run `rtk init -g` to update",
     };
 
     // Rate limit: warn once per day
@@ -232,6 +266,67 @@ mod tests {
         .expect("write settings");
 
         assert!(binary_hook_registered(tmp.path()));
+    }
+
+    #[test]
+    fn test_binary_hook_registered_accepts_plugin_hooks_json() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let hooks = tmp
+            .path()
+            .join(PLUGIN_SUBDIR)
+            .join(PLUGIN_CACHE_SUBDIR)
+            .join("tokenaut")
+            .join("tokenaut")
+            .join("0.2.0")
+            .join(HOOKS_SUBDIR);
+        std::fs::create_dir_all(&hooks).expect("plugin dirs");
+        std::fs::write(
+            hooks.join(HOOKS_JSON),
+            r#"{
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{
+                            "type": "command",
+                            "command": "tokenaut hook claude",
+                            "timeout": 10
+                        }]
+                    }]
+                }
+            }"#,
+        )
+        .expect("write hooks.json");
+
+        // No settings.json at all: the plugin alone must register the hook.
+        assert!(binary_hook_registered(tmp.path()));
+    }
+
+    #[test]
+    fn test_binary_hook_registered_ignores_foreign_plugin_hook() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let hooks = tmp
+            .path()
+            .join(PLUGIN_SUBDIR)
+            .join(PLUGIN_CACHE_SUBDIR)
+            .join("someone-else")
+            .join("other-plugin")
+            .join("1.0.0")
+            .join(HOOKS_SUBDIR);
+        std::fs::create_dir_all(&hooks).expect("plugin dirs");
+        std::fs::write(
+            hooks.join(HOOKS_JSON),
+            r#"{
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "other-tool hook claude"}]
+                    }]
+                }
+            }"#,
+        )
+        .expect("write hooks.json");
+
+        assert!(!binary_hook_registered(tmp.path()));
     }
 
     #[test]
