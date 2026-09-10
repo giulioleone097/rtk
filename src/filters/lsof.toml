@@ -1,0 +1,36 @@
+[filters.lsof]
+description = "Compact lsof output — keep COMMAND, PID, FD, TYPE and NAME, drop the fixed middle columns"
+match_command = "^lsof(\\s|$)"
+strip_ansi = true
+truncate_lines_at = 160
+max_lines = 40
+# USER/DEVICE/SIZE-OFF/NODE are fixed-width noise on every row; the answer an
+# agent reads out of lsof is which process (COMMAND, PID) holds which resource
+# (FD, TYPE, NAME) — FD and TYPE stay because they separate a cwd row from a txt
+# row and an IPv4 listener from an IPv6 one on the same port. A row that does not
+# have all nine columns is left untouched, so an unusual layout degrades to the
+# raw line instead of losing it.
+replace = [
+  { pattern = "^(\\S+)\\s+(\\d+)\\s+\\S+\\s+(\\S+)\\s+(\\S+)\\s+\\S+\\s+\\S+\\s+\\S+\\s+(\\S.*)$", replacement = "$1 $2 $3 $4 $5" },
+  { pattern = "^COMMAND\\s+PID\\s+.*\\bNAME$", replacement = "COMMAND PID FD TYPE NAME" },
+]
+
+[[tests.lsof]]
+name = "listening sockets keep the ipv4/ipv6 distinction on one port"
+input = "COMMAND     PID        USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME\nnode      54321 giulioleone   23u  IPv4 0xa1904f259ca772ec      0t0  TCP *:3000 (LISTEN)\nnode      54321 giulioleone   24u  IPv6 0xe9f85a6f9e2a8ada      0t0  TCP *:3000 (LISTEN)"
+expected = "COMMAND PID FD TYPE NAME\nnode 54321 23u IPv4 *:3000 (LISTEN)\nnode 54321 24u IPv6 *:3000 (LISTEN)"
+
+[[tests.lsof]]
+name = "cwd and txt rows stay distinct"
+input = "node      54321 giulioleone  cwd    DIR               1,16      640 12345 /Users/x\nnode      54321 giulioleone  txt    REG               1,16  1234567 67890 /usr/local/bin/node"
+expected = "node 54321 cwd DIR /Users/x\nnode 54321 txt REG /usr/local/bin/node"
+
+[[tests.lsof]]
+name = "row without the full column set is left verbatim"
+input = "sshd 1234 root"
+expected = "sshd 1234 root"
+
+[[tests.lsof]]
+name = "empty input passes through"
+input = ""
+expected = ""
