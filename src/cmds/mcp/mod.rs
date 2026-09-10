@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::transport::stdio;
-use rmcp::{ErrorData, ServiceExt, tool, tool_router};
+use rmcp::{tool, tool_router, ErrorData, ServiceExt};
 
 use tools::{BatchExecuteInput, SearchInput};
 

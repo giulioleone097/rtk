@@ -73,16 +73,30 @@ async fn run_command(command: String, timeout: Duration) -> Captured {
         .spawn();
     let child = match spawned {
         Ok(child) => child,
-        Err(err) => return Captured { exit: -1, text: format!("failed to spawn: {err}"), bytes: 0 },
+        Err(err) => {
+            return Captured {
+                exit: -1,
+                text: format!("failed to spawn: {err}"),
+                bytes: 0,
+            }
+        }
     };
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => {
             let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
             text.push_str(&String::from_utf8_lossy(&output.stderr));
             let bytes = text.len();
-            Captured { exit: output.status.code().unwrap_or(-1), text: cap(text), bytes }
+            Captured {
+                exit: output.status.code().unwrap_or(-1),
+                text: cap(text),
+                bytes,
+            }
         }
-        Ok(Err(err)) => Captured { exit: -1, text: format!("failed to run: {err}"), bytes: 0 },
+        Ok(Err(err)) => Captured {
+            exit: -1,
+            text: format!("failed to run: {err}"),
+            bytes: 0,
+        },
         // Dropping the wait future drops the child, and `kill_on_drop` kills it.
         Err(_) => Captured {
             exit: 124,
@@ -121,8 +135,7 @@ impl Renderer {
         match self.seen.get(&section.content) {
             Some(first) => format!("{header}(already shown above for \"{first}\")\n"),
             None => {
-                self.seen
-                    .insert(section.content.clone(), query.to_string());
+                self.seen.insert(section.content.clone(), query.to_string());
                 format!("{header}{}\n", section.content)
             }
         }
@@ -199,7 +212,11 @@ fn render_batch(store: &Store, input: &BatchExecuteInput, captured: &[Captured])
 /// `ctx_search` against the default index.
 pub fn search(input: SearchInput) -> Result<String> {
     let store = Store::open_default()?;
-    search_in(&store, &input.queries, input.limit.unwrap_or(DEFAULT_SEARCH_LIMIT))
+    search_in(
+        &store,
+        &input.queries,
+        input.limit.unwrap_or(DEFAULT_SEARCH_LIMIT),
+    )
 }
 
 /// `ctx_search` against `store`.
@@ -235,7 +252,10 @@ mod tests {
             .build()
             .unwrap();
         let captured = runtime
-            .block_on(run_all(&input.commands, Duration::from_millis(DEFAULT_TIMEOUT_MS)))
+            .block_on(run_all(
+                &input.commands,
+                Duration::from_millis(DEFAULT_TIMEOUT_MS),
+            ))
             .unwrap();
 
         let dir = tempfile::tempdir().unwrap();
