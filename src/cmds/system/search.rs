@@ -266,10 +266,13 @@ fn unparsed_signal(stdout: &str) -> usize {
 /// rg is the fallback when grep is absent, rejects a flag, or `--type` is used.
 /// The search engine the agent actually invoked. RTK runs this binary verbatim
 /// and never substitutes one for the other.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Engine {
     Grep,
     Rg,
+    /// `git grep`: same match shape as grep, scoped to the repository's tracked
+    /// files instead of a path list.
+    GitGrep,
 }
 
 impl Engine {
@@ -277,21 +280,45 @@ impl Engine {
         match self {
             Engine::Grep => "grep",
             Engine::Rg => "rg",
+            Engine::GitGrep => "git",
+        }
+    }
+
+    /// Words inserted before the agent's arguments because the engine is a
+    /// subcommand of its binary rather than the binary itself.
+    fn prefix_args(self) -> &'static [&'static str] {
+        match self {
+            Engine::GitGrep => &["grep"],
+            _ => &[],
         }
     }
 
     pub fn label(self) -> &'static str {
-        self.bin()
+        match self {
+            Engine::GitGrep => "git grep",
+            _ => self.bin(),
+        }
     }
 
     /// `-n -H --null` are parse aids (NUL keeps the regroup unambiguous, #1436);
     /// `-I` skips binary noise (-a overrides).
     fn parse_flags(self) -> &'static [&'static str] {
         match self {
-            Engine::Grep => &["-n", "-H", "-I", "--null"],
+            Engine::Grep | Engine::GitGrep => &["-n", "-H", "-I", "--null"],
             Engine::Rg => &["-n", "--with-filename", "--null"],
         }
     }
+}
+
+/// `git grep --null` NUL-separates the line number from the content as well,
+/// where grep and rg keep the `:` (match) or `-` (context) marker
+/// [`parse_match_line`] reads. Restoring the `:` here lets `git grep` share the
+/// whole grouping path unchanged; it is only correct because output carrying
+/// context lines never reaches this point (see [`is_simple_git_grep`]).
+fn restore_git_grep_separator(stdout: &str) -> String {
+    static GIT_GREP_PREFIX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^([^\x00]+\x00\d+)\x00").unwrap());
+    GIT_GREP_PREFIX.replace_all(stdout, "${1}:").into_owned()
 }
 
 /// Runs the agent's exact engine + flags for the grouping path, appending only the
@@ -303,7 +330,11 @@ fn engine_capture<T: AsRef<str>>(
     paths: &[String],
 ) -> Result<CaptureResult> {
     let mut cmd = engine_command(engine, extra_args, patterns, paths, false);
-    exec_capture_stdin(&mut cmd).context("search failed")
+    let mut result = exec_capture_stdin(&mut cmd).context("search failed")?;
+    if engine == Engine::GitGrep {
+        result.stdout = restore_git_grep_separator(&result.stdout);
+    }
+    Ok(result)
 }
 
 fn engine_command<T: AsRef<str>>(
@@ -314,6 +345,7 @@ fn engine_command<T: AsRef<str>>(
     line_buffered: bool,
 ) -> Command {
     let mut cmd = resolved_command(engine.bin());
+    cmd.args(engine.prefix_args());
     cmd.args(engine.parse_flags());
     for a in extra_args {
         cmd.arg(a.as_ref());
@@ -447,6 +479,7 @@ fn passthrough<T: AsRef<str>>(
     stream_stdin: bool,
 ) -> Result<i32> {
     let mut cmd = resolved_command(engine.bin());
+    cmd.args(engine.prefix_args());
     if stream_stdin && !std::io::stdout().is_terminal() {
         // Keep passthrough output live when stdout is piped.
         cmd.arg("--line-buffered");
@@ -476,6 +509,47 @@ fn has_short_flag(flags: &[String], ch: char) -> bool {
     flags
         .iter()
         .any(|f| f.starts_with('-') && !f.starts_with("--") && f[1..].contains(ch))
+}
+
+/// The one `git grep` shape RTK regroups: boolean flags it already reproduces,
+/// exactly one pattern, and pathspecs. Everything else runs verbatim, because
+/// `git grep` accepts forms RTK's grep parser reads as something else: a
+/// revision (`git grep -n foo HEAD`, which the inserted `--` would turn into a
+/// pathspec), a boolean expression (`--and`, `--or`, `--not`, `--all-match`),
+/// several `-e` patterns, function context (`-W`, `-p`) and the context flags
+/// whose `:`/`-` marker `--null` erases (see [`restore_git_grep_separator`]).
+///
+/// ceiling: a positional is taken as a pathspec when it exists on disk, so a
+/// file named like a revision is filtered here while git rejects it as
+/// ambiguous. Upgrade trigger: ask `git rev-parse --verify` before accepting.
+fn is_simple_git_grep(args: &[String]) -> bool {
+    /// Boolean flags whose output shape `git grep` keeps `file:line:content`.
+    const BOOLEAN_SHORT: &str = "niwvEFPIhH";
+    let mut patterns = 0;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            // Everything after `--` is a pathspec by definition.
+            break;
+        } else if arg == "-e" {
+            patterns += 1;
+            i += 2;
+            continue;
+        } else if arg == "--cached" {
+            // No-op: a boolean flag that does not change the match shape.
+        } else if let Some(letters) = arg.strip_prefix('-').filter(|s| !s.is_empty()) {
+            if !letters.chars().all(|c| BOOLEAN_SHORT.contains(c)) {
+                return false;
+            }
+        } else if patterns == 0 {
+            patterns = 1;
+        } else if !std::path::Path::new(arg).exists() {
+            return false;
+        }
+        i += 1;
+    }
+    patterns == 1
 }
 
 fn has_context_flag(flags: &[String]) -> bool {
@@ -510,6 +584,7 @@ pub fn run(
         .any(|a| a == "--version" || a == "--help" || a == "-h")
     {
         let mut cmd = resolved_command(engine.bin());
+        cmd.args(engine.prefix_args());
         cmd.args(args);
         let result = exec_capture(&mut cmd).context("search failed")?;
         print!("{}", result.stdout);
@@ -542,12 +617,20 @@ pub fn run(
         eprintln!("grep: '{}' in {}", pattern_display, path_display);
     }
 
-    let reads_piped_stdin = !std::io::stdin().is_terminal()
+    // `git grep` searches the repository, never stdin, so an empty path list is
+    // not the "read the pipe" form it is for grep and rg.
+    let reads_piped_stdin = engine != Engine::GitGrep
+        && !std::io::stdin().is_terminal()
         && (paths.is_empty() || paths.iter().any(|path| path == "-"));
 
     // format/shape flags (-c/-l/-o/...): already-minimal native output, passthrough.
     if has_format_flag(&extra_args) {
         return passthrough(&timer, engine, &args, &real_cmd, reads_piped_stdin);
+    }
+
+    // Only the simple `git grep` shape is regrouped; see is_simple_git_grep.
+    if engine == Engine::GitGrep && !is_simple_git_grep(&args) {
+        return passthrough(&timer, engine, &args, &real_cmd, false);
     }
 
     if reads_piped_stdin {
@@ -614,7 +697,10 @@ pub fn run(
     // show one (multiple files, a directory, -r or -H), the line number only with
     // -n. We force -nH--null for robust parsing, then drop what the engine itself
     // would not have shown.
-    let show_file = by_file.len() > 1 || show_file(&paths, &extra_args);
+    // `git grep` prints the filename on every match by default, so keeping it is
+    // what the agent's own command would have shown.
+    let show_file =
+        by_file.len() > 1 || engine == Engine::GitGrep || show_file(&paths, &extra_args);
     let show_line = show_line(&extra_args);
 
     // Faithful baseline: exactly what the real command prints, full content.
@@ -1484,6 +1570,39 @@ mod tests {
 
     // --- issues #1436 / #1613: parse_match_line robustness (single-file colon misparse) ---
     // Input shape is `file\0line[:-]content` (rg --null / grep -Z).
+
+    /// `git grep --null` emits `file\0line\0content`; the shared parser needs
+    #[test]
+    fn test_is_simple_git_grep() {
+        let args = |s: &str| -> Vec<String> {
+            s.split_whitespace().map(str::to_string).collect::<Vec<_>>()
+        };
+        assert!(is_simple_git_grep(&args("-n Engine src/cmds/system/search.rs")));
+        assert!(is_simple_git_grep(&args("-ni foo -- src")));
+        assert!(is_simple_git_grep(&args("--cached -e foo")));
+        // A bare word that is not a path is a revision, not a pathspec.
+        assert!(!is_simple_git_grep(&args("-n tokenize HEAD")));
+        assert!(!is_simple_git_grep(&args("-e fn --and -e pub")));
+        assert!(!is_simple_git_grep(&args("-n -W foo")));
+        assert!(!is_simple_git_grep(&args("-n -C 2 foo")));
+    }
+
+    /// the `:` back between line and content, and a content NUL must survive.
+    #[test]
+    fn test_restore_git_grep_separator() {
+        let restored =
+            restore_git_grep_separator("src/a.rs\x0012\x00let x = 1;\nsrc/b.rs\x007\x00fn y() {}\n");
+        assert_eq!(
+            restored,
+            "src/a.rs\x0012:let x = 1;\nsrc/b.rs\x007:fn y() {}\n"
+        );
+        let (file, line_num, is_match, content) =
+            parse_match_line(restored.lines().next().unwrap()).unwrap();
+        assert_eq!(file, "src/a.rs");
+        assert_eq!(line_num, 12);
+        assert!(is_match);
+        assert_eq!(content, "let x = 1;");
+    }
 
     #[test]
     fn test_parse_match_line_simple() {

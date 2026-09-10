@@ -1021,6 +1021,12 @@ enum GitCommands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Matches grouped by file (shares the `rtk grep` output filter)
+    Grep {
+        /// Git grep arguments (pattern, pathspec, and all git grep flags)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Passthrough: runs any unsupported git subcommand directly
     #[command(external_subcommand)]
     Other(Vec<OsString>),
@@ -1958,6 +1964,16 @@ fn run_cli() -> Result<i32> {
                     cli.verbose,
                     &global_args,
                 )?,
+                GitCommands::Grep { args } if global_args.is_empty() => {
+                    search::run(search::Engine::GitGrep, 80, 200, false, &args, cli.verbose)?
+                }
+                // Global options must precede the subcommand, which the shared
+                // search path cannot express — run git verbatim instead.
+                GitCommands::Grep { args } => {
+                    let mut raw: Vec<OsString> = vec!["grep".into()];
+                    raw.extend(args.iter().map(OsString::from));
+                    git::run_passthrough(&raw, &global_args, cli.verbose)?
+                }
                 GitCommands::Other(args) => git::run_passthrough(&args, &global_args, cli.verbose)?,
             }
         }

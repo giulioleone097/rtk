@@ -37,7 +37,9 @@ impl Default for RtkRule {
 
 pub const RULES: &[RtkRule] = &[
     RtkRule {
-        pattern: r"^(?:git|yadm)\s+(?:-[Cc]\s+\S+\s+)*(status|log|diff|show|add|commit|checkout|push|pull|branch|fetch|stash|worktree)",
+        // `grep` is a git-only branch: `rtk git grep` searches the repository in
+        // the cwd, which is not the dotfiles repository `yadm grep` searches.
+        pattern: r"^(?:(?:git|yadm)\s+(?:-[Cc]\s+\S+\s+)*(status|log|diff|show|add|commit|checkout|push|pull|branch|fetch|stash|worktree)|git\s+(?:-[Cc]\s+\S+\s+)*grep)",
         rtk_cmd: "rtk git",
         rewrite_prefixes: &["git", "yadm"],
         category: "Git",

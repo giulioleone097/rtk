@@ -8,6 +8,7 @@
 - Default `git status` uses `--porcelain -b` so the compact output never exceeds raw `git status` (an untracked directory collapses to a single line, matching git's default); branch/short-only flags reuse the compact path, other explicit args still pass through unchanged
 - Global git options (`-C`, `--git-dir`, `--work-tree`, `--no-pager`) are prepended before the subcommand
 - Exit code propagation is critical for CI/CD pipelines
+- `git grep` is **not** handled in `git.rs`: it routes to `search.rs` as `Engine::GitGrep` so it shares the `rtk grep`/`rtk rg` grouping, and only for the simple shape `is_simple_git_grep` accepts. With a global option present (`-C`, `--git-dir`, …) it falls back to `run_passthrough`, since those must precede the subcommand
 - **glab_cmd.rs** declares `-R`/`--repo` and `-g`/`--group` at the clap level; they are **appended** to the glab args (not prepended) so subcommand dispatch stays intact
 - `has_output_flag()` short-circuits to passthrough when the user explicitly requests `-F` / `--output` / `--json` (avoids double JSON injection)
 - `should_passthrough_view()` redirects `mr/issue view` to passthrough when `--web` or `--comments` is set
