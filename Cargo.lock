@@ -1511,7 +1511,6 @@ dependencies = [
  "regex",
  "rmcp",
  "rusqlite",
- "schemars",
  "serde",
  "serde_json",
  "sha2",

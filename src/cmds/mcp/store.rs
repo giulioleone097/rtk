@@ -1,12 +1,21 @@
-//! SQLite FTS5 index backing the `rtk mcp` context tools.
+//! SQLite FTS5 index backing the `tokenaut mcp` context tools.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 
 /// Upper bound, in characters, of an indexed chunk.
 const MAX_CHUNK_CHARS: usize = 1500;
+
+/// What one call to [`Store::index`] wrote.
+pub struct Indexed {
+    /// Chunks the text was split into.
+    pub chunks: usize,
+    /// Chunks already present under this source, so not inserted again.
+    pub skipped: usize,
+}
 
 /// One indexed chunk as returned by a search.
 pub struct Section {
@@ -21,7 +30,7 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open the index under the rtk config directory, creating both if missing.
+    /// Open the index under the tokenaut config directory, creating both if missing.
     pub fn open_default() -> Result<Self> {
         let dir = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -38,25 +47,37 @@ impl Store {
                  source,
                  content,
                  ts UNINDEXED,
-                 session UNINDEXED,
                  tokenize = 'unicode61'
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS chunk_keys (key TEXT PRIMARY KEY);",
         )?;
         Ok(Self { conn })
     }
 
-    /// Chunk `text` and index every chunk under `source`. Returns the chunk count.
-    pub fn index(&self, source: &str, text: &str) -> Result<usize> {
+    /// Chunk `text` and index every chunk not yet stored under `source`.
+    pub fn index(&self, source: &str, text: &str) -> Result<Indexed> {
         let ts = chrono::Local::now().to_rfc3339();
-        let session = std::env::var("CLAUDE_SESSION_ID").unwrap_or_default();
         let chunks = chunk(text);
-        let mut stmt = self
+        let mut claim = self
             .conn
-            .prepare("INSERT INTO chunks(source, content, ts, session) VALUES (?1, ?2, ?3, ?4)")?;
+            .prepare("INSERT OR IGNORE INTO chunk_keys(key) VALUES (?1)")?;
+        let mut insert = self
+            .conn
+            .prepare("INSERT INTO chunks(source, content, ts) VALUES (?1, ?2, ?3)")?;
+        let mut skipped = 0;
         for content in &chunks {
-            stmt.execute((source, content, &ts, &session))?;
+            // Claiming the key first keeps a re-run of the same command from
+            // filling the bm25 slots with copies of itself.
+            if claim.execute((chunk_key(source, content),))? == 0 {
+                skipped += 1;
+                continue;
+            }
+            insert.execute((source, content, &ts))?;
         }
-        Ok(chunks.len())
+        Ok(Indexed {
+            chunks: chunks.len(),
+            skipped,
+        })
     }
 
     /// The `limit` best chunks for `query`, ranked by bm25. `rowid` breaks ties so
@@ -81,14 +102,24 @@ impl Store {
     }
 }
 
-/// Quote every term so client punctuation cannot be read as FTS5 syntax.
-/// Terms stay implicitly ANDed, which is FTS5's own default.
+/// Quote every term so client punctuation cannot be read as FTS5 syntax, and
+/// join them with OR so a natural-language question still matches: bm25 then
+/// ranks by how many of its terms a chunk covers.
 fn fts_query(query: &str) -> String {
     query
         .split_whitespace()
         .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" OR ")
+}
+
+/// Identity of a chunk within one source, for the duplicate guard.
+fn chunk_key(source: &str, content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(source.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// Split `text` on blank lines, packing paragraphs into chunks of at most

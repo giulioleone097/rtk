@@ -42,8 +42,7 @@ quick-xml = "0.37"
 which = "8"
 automod = "1"
 rmcp = { version = "3.3", default-features = false, features = ["server", "macros", "transport-io"] }
-tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "io-util", "macros"] }
-schemars = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "io-util", "sync"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

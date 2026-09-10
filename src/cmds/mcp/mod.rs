@@ -1,13 +1,13 @@
-//! `rtk mcp`: an MCP server over stdio exposing the context tools.
+//! `tokenaut mcp`: an MCP server over stdio exposing the context tools.
 
 mod store;
 mod tools;
 
 use anyhow::{Context, Result};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::transport::stdio;
-use rmcp::{tool, tool_router, ErrorData, ServiceExt};
+use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
 
 use tools::{BatchExecuteInput, SearchInput};
 
@@ -15,7 +15,7 @@ use tools::{BatchExecuteInput, SearchInput};
 #[derive(Debug, Clone, Default)]
 pub struct ContextServer;
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl ContextServer {
     /// Run shell commands in parallel, index their output, and answer the queries against the index.
     #[tool]
@@ -33,6 +33,20 @@ impl ContextServer {
         Parameters(input): Parameters<SearchInput>,
     ) -> Result<CallToolResult, ErrorData> {
         text_result(tools::search(input))
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for ContextServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("tokenaut", env!("CARGO_PKG_VERSION")))
+            .with_instructions(
+                "ctx_batch_execute runs shell commands in parallel, indexes their output \
+                 and answers queries against that index; ctx_search answers queries against \
+                 everything indexed so far. Content already shown earlier in a response is \
+                 replaced by a back-reference to where it first appeared.",
+            )
     }
 }
 
