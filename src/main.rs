@@ -1743,7 +1743,7 @@ fn main() {
     let code = match run_cli() {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("rtk: {:#}", e);
+            eprintln!("{}: {:#}", core::constants::BIN, e);
             1
         }
     };
@@ -1791,8 +1791,10 @@ fn run_cli() -> Result<i32> {
     };
 
     // Warn if installed hook is outdated/missing (1/day, non-blocking).
-    // Skip for Gain — it shows its own inline hook warning.
-    if !matches!(cli.command, Commands::Gain { .. }) {
+    // Skip for Gain — it shows its own inline hook warning — and for Hook, which
+    // is the hook itself: it runs on every tool call and its stderr is the hook
+    // protocol's, not a place for advice about installing it.
+    if !matches!(cli.command, Commands::Gain { .. } | Commands::Hook { .. }) {
         hooks::hook_check::maybe_warn();
     }
 

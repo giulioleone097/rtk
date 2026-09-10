@@ -1,5 +1,6 @@
 //! Shows users how many tokens RTK has saved them over time.
 
+use crate::core::constants::BIN;
 use crate::core::display_helpers::{format_duration, print_period_table};
 use crate::core::tracking::{DayStats, MonthStats, Tracker, WeekStats};
 use crate::core::utils::{format_tokens, truncate};
@@ -78,7 +79,7 @@ pub fn run(
 
     if summary.total_commands == 0 {
         println!("No tracking data yet.");
-        println!("Run some rtk commands to start tracking savings.");
+        println!("Run some {BIN} commands to start tracking savings.");
         return Ok(());
     }
 
@@ -152,7 +153,7 @@ pub fn run(
             eprintln!(
                 "{}",
                 format!(
-                    "[rtk] {untrusted_filters} untrusted custom filter(s) not applied — run `rtk trust`"
+                    "[{BIN}] {untrusted_filters} untrusted custom filter(s) not applied — run `{BIN} trust`"
                 )
                 .yellow()
             );
@@ -684,7 +685,7 @@ fn check_rtk_disabled_bypass() -> Option<String> {
     let pct = (bypassed as f64 / total_bash as f64) * 100.0;
     if pct > 10.0 {
         Some(format!(
-            "[warn] {} commands ({:.0}%) used RTK_DISABLED=1 unnecessarily — run `rtk discover` for details",
+            "[warn] {} commands ({:.0}%) used RTK_DISABLED=1 unnecessarily — run `{BIN} discover` for details",
             bypassed, pct
         ))
     } else {

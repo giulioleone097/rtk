@@ -17,10 +17,11 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime};
 
-/// Claude Code config directories scanned when `--config-dir` is not given.
-const DEFAULT_CONFIG_DIRS: [&str; 2] = [".claude", ".claude-coesia"];
+/// Prefix of a Claude Code config directory in the home dir. Claude Code itself
+/// only ever creates `.claude`, but a second instance is normally run by pointing
+/// `$CLAUDE_CONFIG_DIR` at a sibling, so the whole family is scanned.
+const CONFIG_DIR_PREFIX: &str = ".claude";
 const CLASSES: [&str; 3] = ["bash-pipe", "ctx-search", "ctx-batch"];
 const BASH_PIPE: usize = 0;
 const CTX_SEARCH: usize = 1;
@@ -101,14 +102,10 @@ pub fn run(days: u64, config_dirs: &[PathBuf], gaps: bool) -> i32 {
     if gaps {
         return gaps::run(days, &config_dirs);
     }
-    let cutoff = SystemTime::now()
-        .checked_sub(Duration::from_secs(days * 24 * 60 * 60))
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-
     let mut totals = Totals::default();
     let mut files = 0usize;
     for dir in &config_dirs {
-        for path in transcripts(dir, cutoff) {
+        for path in transcripts(dir, days) {
             files += 1;
             scan_file(&path, &mut totals);
         }
@@ -180,40 +177,46 @@ fn print_producers(totals: &Totals) {
 
 /// The directories to scan: what `--config-dir` named, or the default pair under
 /// the home directory when it named none.
+/// The config directories to scan: `--config-dir` when given, else `$CLAUDE_CONFIG_DIR`
+/// plus every `~/.claude*` directory that actually holds transcripts. Discovered
+/// rather than listed, because the second config dir's name is a local convention
+/// and a hardcoded one measures the wrong machine.
 fn resolve_config_dirs(requested: &[PathBuf]) -> Vec<PathBuf> {
     if !requested.is_empty() {
         return requested.to_vec();
     }
-    let Some(home) = dirs::home_dir() else {
-        return Vec::new();
-    };
-    DEFAULT_CONFIG_DIRS.iter().map(|d| home.join(d)).collect()
-}
-
-/// `<config-dir>/projects/*/*.jsonl` modified after `cutoff`.
-fn transcripts(config_dir: &Path, cutoff: SystemTime) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    let Ok(projects) = std::fs::read_dir(config_dir.join("projects")) else {
-        return paths;
-    };
-    for project in projects.flatten() {
-        let Ok(entries) = std::fs::read_dir(project.path()) else {
-            continue;
-        };
-        for entry in entries.flatten() {
+    let mut dirs_found: Vec<PathBuf> = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.join("projects").is_dir())
+        .into_iter()
+        .collect();
+    if let Some(home) = dirs::home_dir() {
+        for entry in std::fs::read_dir(&home).into_iter().flatten().flatten() {
             let path = entry.path();
-            if path.extension().is_none_or(|ext| ext != "jsonl") {
-                continue;
-            }
-            let recent = entry
-                .metadata()
-                .and_then(|meta| meta.modified())
-                .is_ok_and(|modified| modified >= cutoff);
-            if recent {
-                paths.push(path);
+            let named_claude = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(CONFIG_DIR_PREFIX));
+            if named_claude && path.join("projects").is_dir() && !dirs_found.contains(&path) {
+                dirs_found.push(path);
             }
         }
     }
+    dirs_found.sort();
+    dirs_found
+}
+
+/// Every `<config-dir>/projects/**/*.jsonl` modified in the last `days`, through
+/// the walk `discover` uses. A project directory also holds `subagents/`
+/// transcripts one level deeper, and a shallow read of it would measure a smaller
+/// corpus than the audit reports on.
+fn transcripts(config_dir: &Path, days: u64) -> Vec<PathBuf> {
+    let mut paths = crate::discover::provider::ClaudeProvider::discover_sessions_in_projects_dir(
+        &config_dir.join("projects"),
+        None,
+        Some(days),
+    )
+    .unwrap_or_default();
     paths.sort();
     paths
 }
@@ -353,27 +356,68 @@ fn classify(name: &str, input: &Value) -> Option<usize> {
     None
 }
 
-/// The command that produced the bytes: the first word of the first pipeline stage,
-/// past any `VAR=value` assignment, `cd x &&` prefix, `sudo`, `command` or `env`.
-/// A newline and a `;` separate stages exactly like `&&` does, and `do` or `then`
-/// only opens a body, so none of them can be the producer. The stage itself comes
-/// from the quote-aware scanner, so a newline inside a quoted script is not a break.
+/// Wrapper words a producer walk steps over before reaching the real command.
+const WRAPPERS: [&str; 5] = ["sudo", "time", "nohup", "command", "env"];
+/// Keywords that open a compound statement: the command runs in its body, so the
+/// segment they head never names the producer (`for f in a b; do node run.js`).
+const BODY_OPENERS: [&str; 6] = ["for", "while", "until", "if", "case", "select"];
+
+/// The command that produced the bytes: the first top-level segment that is
+/// neither a `cd`, a bare `NAME=value` assignment nor a compound-statement head,
+/// reduced to the first word of its first pipeline stage past any assignment,
+/// wrapper or `timeout <duration>`. A newline and a `;` separate segments exactly
+/// like `&&` does. Segments come from the quote-aware scanner, so a newline or a
+/// pipe inside a quoted script is not a break.
 fn producer(command: &str) -> String {
-    let stage = filters::first_pipeline_stage(command);
-    for word in stage.split_whitespace() {
-        if matches!(word, "sudo" | "command" | "env" | "do" | "then") {
+    for segment in filters::top_level_segments(command) {
+        let trimmed = segment.trim();
+        let mut words = trimmed.split_whitespace().peekable();
+        let Some(&first) = words.peek() else {
+            continue;
+        };
+        if first == "cd" || BODY_OPENERS.contains(&first) {
             continue;
         }
-        match assignment_value(word) {
-            // `n=$(grep ... | cut ...)` pipes inside the substitution: name what runs there.
-            Some(value) => match value.strip_prefix("$(").or_else(|| value.strip_prefix('`')) {
-                Some(inner) if !inner.is_empty() => return inner.to_string(),
-                _ => continue,
-            },
-            None => return word.trim_start_matches(['(', '{', '`', '!']).to_string(),
+        if words.clone().all(|word| assignment_value(word).is_some()) {
+            continue;
         }
+        return stage_producer(&filters::first_pipeline_stage(trimmed));
     }
     "(none)".to_string()
+}
+
+/// The producer inside a single stage: skip leading assignments, wrappers and
+/// body openers, then take the next word.
+fn stage_producer(stage: &str) -> String {
+    let mut words = stage.split_whitespace().peekable();
+    while let Some(&word) = words.peek() {
+        if let Some(value) = assignment_value(word) {
+            // `n=$(grep ... | cut ...)` pipes inside the substitution: name what runs there.
+            match value.strip_prefix("$(").or_else(|| value.strip_prefix('`')) {
+                Some(inner) if !inner.is_empty() => return inner.to_string(),
+                _ => {
+                    words.next();
+                    continue;
+                }
+            }
+        }
+        if word == "timeout" {
+            words.next();
+            if words.peek().is_some_and(|arg| is_timeout_duration(arg)) {
+                words.next();
+            }
+            continue;
+        }
+        if WRAPPERS.contains(&word) || matches!(word, "do" | "then") {
+            words.next();
+            continue;
+        }
+        break;
+    }
+    match words.next() {
+        Some(word) => word.trim_start_matches(['(', '{', '`', '!']).to_string(),
+        None => "(none)".to_string(),
+    }
 }
 
 /// The value of a leading `NAME=value` assignment, if the word is one.
@@ -381,6 +425,12 @@ fn assignment_value(word: &str) -> Option<&str> {
     let (name, value) = word.split_once('=')?;
     let named = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     named.then_some(value)
+}
+
+/// `30s`, `30`, `1m`: a leading run of digits followed by an optional unit.
+fn is_timeout_duration(word: &str) -> bool {
+    let digits = word.trim_end_matches(['s', 'm', 'h', 'd']);
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
 }
 
 fn result_text(content: &Value) -> Option<String> {
@@ -547,17 +597,14 @@ fn first_line(text: &str) -> String {
 /// or not) and the question per unique command text is binary: does the rewrite
 /// engine `hook check` calls return a rewrite for it.
 mod gaps {
-    use super::{filters, result_text, transcripts, HashMap};
+    use super::{producer, result_text, transcripts, HashMap};
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, SystemTime};
 
     /// A command this long is never rewritten in practice, so it is counted
     /// not-rewritten without asking the engine.
     const MAX_CHECKED_COMMAND_BYTES: usize = 4000;
     const TOP_PRODUCERS: usize = 20;
     const EXAMPLE_CHARS: usize = 70;
-    /// Wrapper words a producer walk steps over before reaching the real command.
-    const WRAPPERS: [&str; 5] = ["sudo", "time", "nohup", "command", "env"];
 
     #[derive(Default)]
     struct CommandStats {
@@ -574,13 +621,9 @@ mod gaps {
     }
 
     pub fn run(days: u64, config_dirs: &[PathBuf]) -> i32 {
-        let cutoff = SystemTime::now()
-            .checked_sub(Duration::from_secs(days * 24 * 60 * 60))
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-
         let mut commands: HashMap<String, CommandStats> = HashMap::new();
         for dir in config_dirs {
-            for path in transcripts(dir, cutoff) {
+            for path in transcripts(dir, days) {
                 scan_file(&path, &mut commands);
             }
         }
@@ -721,78 +764,6 @@ mod gaps {
                 (command.clone(), rewritten)
             })
             .collect()
-    }
-
-    /// The command --gaps groups a not-rewritten result under: the first word of
-    /// the first top-level segment that is not a `cd` or a pure `NAME=value`
-    /// assignment, itself past any leading assignment or wrapper word (including
-    /// `timeout`'s duration argument).
-    /// ceiling: word-based, unlike the bash-pipe `producer()` above it does not
-    /// follow a `$(...)` command substitution back to the command that runs inside
-    /// it; acceptable because this only groups the not-rewritten table, it does not
-    /// change which bytes count as rewritten.
-    fn producer(command: &str) -> String {
-        for segment in filters::top_level_segments(command) {
-            let trimmed = segment.trim();
-            let mut words = trimmed.split_whitespace().peekable();
-            let Some(&first) = words.peek() else {
-                continue;
-            };
-            if first == "cd" {
-                continue;
-            }
-            if words.clone().all(is_assignment) {
-                continue;
-            }
-            let stage = filters::first_pipeline_stage(trimmed);
-            return stage_producer(&stage);
-        }
-        "(none)".to_string()
-    }
-
-    /// The producer inside a single stage: skip leading assignments and wrappers,
-    /// then take the next word.
-    fn stage_producer(stage: &str) -> String {
-        let mut words = stage.split_whitespace().peekable();
-        while let Some(&word) = words.peek() {
-            if is_assignment(word) {
-                words.next();
-                continue;
-            }
-            if word == "timeout" {
-                words.next();
-                if let Some(&arg) = words.peek() {
-                    if is_timeout_duration(arg) {
-                        words.next();
-                    }
-                }
-                continue;
-            }
-            if WRAPPERS.contains(&word) {
-                words.next();
-                continue;
-            }
-            break;
-        }
-        match words.next() {
-            Some(word) => word.trim_start_matches(['(', '{', '`', '!']).to_string(),
-            None => "(none)".to_string(),
-        }
-    }
-
-    fn is_assignment(word: &str) -> bool {
-        match word.split_once('=') {
-            Some((name, _)) => {
-                !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            }
-            None => false,
-        }
-    }
-
-    /// `30s`, `30`, `1m`: a leading run of digits followed by an optional unit.
-    fn is_timeout_duration(word: &str) -> bool {
-        let digits = word.trim_end_matches(['s', 'm', 'h', 'd']);
-        !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
     }
 
     #[cfg(test)]

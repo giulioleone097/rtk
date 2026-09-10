@@ -1979,11 +1979,11 @@ mod tests {
 
         env::remove_var("RTK_DB_PATH");
         let db_path = get_db_path().expect("Failed to get db path");
-        let expected = std::path::Path::new(RTK_DATA_DIR).join(HISTORY_DB);
+        // Literal, not the constants the code itself uses: this pins the name the
+        // database actually has on disk, which a rename must be forced to notice.
         assert!(
-            db_path.ends_with(&expected),
-            "expected default path ending with {}, got: {}",
-            expected.display(),
+            db_path.ends_with("tokenaut/history.db"),
+            "expected default path ending with tokenaut/history.db, got: {}",
             db_path.display()
         );
     }

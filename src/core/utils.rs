@@ -5,6 +5,7 @@
 //! - Text truncation
 //! - Command execution with error context
 
+use crate::core::constants::BIN;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use regex::Regex;
@@ -240,11 +241,11 @@ pub fn exit_code_from_output(output: &std::process::Output, label: &str) -> i32 
             {
                 use std::os::unix::process::ExitStatusExt;
                 if let Some(sig) = output.status.signal() {
-                    eprintln!("[rtk] {}: process terminated by signal {}", label, sig);
+                    eprintln!("[{BIN}] {}: process terminated by signal {}", label, sig);
                     return 128 + sig;
                 }
             }
-            eprintln!("[rtk] {}: process terminated by signal", label);
+            eprintln!("[{BIN}] {}: process terminated by signal", label);
             1
         }
     }
@@ -261,11 +262,11 @@ pub fn exit_code_from_status(status: &std::process::ExitStatus, label: &str) -> 
             {
                 use std::os::unix::process::ExitStatusExt;
                 if let Some(sig) = status.signal() {
-                    eprintln!("[rtk] {}: process terminated by signal {}", label, sig);
+                    eprintln!("[{BIN}] {}: process terminated by signal {}", label, sig);
                     return 128 + sig;
                 }
             }
-            eprintln!("[rtk] {}: process terminated by signal", label);
+            eprintln!("[{BIN}] {}: process terminated by signal", label);
             1
         }
     }
@@ -275,7 +276,7 @@ pub fn exit_code_from_status(status: &std::process::ExitStatus, label: &str) -> 
 /// when filter parsing fails. Logs a diagnostic to stderr.
 pub fn fallback_tail(output: &str, label: &str, n: usize) -> String {
     eprintln!(
-        "[rtk] {}: output format not recognized, showing last {} lines",
+        "[{BIN}] {}: output format not recognized, showing last {} lines",
         label, n
     );
     let lines: Vec<&str> = output.lines().collect();
@@ -305,7 +306,11 @@ pub fn adopt_legacy_state_dirs() {
         }
         // Stage then rename: the tracking database is the bulk of the copy, and a
         // run interrupted halfway through it must not leave a truncated one in place.
-        let staging = base.join(format!("{RTK_DATA_DIR}.incoming"));
+        // The staging name carries the pid, so two first runs racing each other copy
+        // into separate directories and neither deletes the other's work; the loser's
+        // rename onto a populated `current` fails with ENOTEMPTY and is discarded.
+        let staging = base.join(format!("{RTK_DATA_DIR}.incoming.{}", std::process::id()));
+        // Only ours: a crash under a since-recycled pid can leave one behind.
         let _ = fs::remove_dir_all(&staging);
         if create_private_dir(&staging).is_ok() && copy_dir_contents(&legacy, &staging).is_ok() {
             let _ = fs::rename(&staging, &current);

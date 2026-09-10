@@ -7,6 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
+use crate::core::constants::BIN;
 use crate::core::utils::{from_json_str, strip_leading_bom};
 use crate::hooks::constants::{
     CONFIG_DIR, COPILOT_HOME_ENV, COPILOT_HOOK_FILE, COPILOT_INSTRUCTIONS_FILE, COPILOT_USER_DIR,
@@ -3908,7 +3909,7 @@ fn show_claude_config() -> Result<()> {
     let global_claude_md = claude_dir.join(CLAUDE_MD);
     let local_claude_md = PathBuf::from(CLAUDE_MD);
 
-    println!("rtk Configuration:\n");
+    println!("{BIN} Configuration:\n");
 
     // Check hook: prefer binary command detection, fall back to script file
     let settings_path = claude_dir.join(SETTINGS_JSON);
@@ -3946,7 +3947,7 @@ fn show_claude_config() -> Result<()> {
                 );
             } else if !is_thin_delegator {
                 println!(
-                    "[warn] Hook: {} (outdated — run `rtk init -g` to upgrade to native binary)",
+                    "[warn] Hook: {} (outdated — run `{BIN} init -g` to upgrade to native binary)",
                     hook_path.display()
                 );
             } else if is_executable && has_guards {
@@ -4141,7 +4142,7 @@ fn show_codex_config() -> Result<()> {
     let local_agents_md = PathBuf::from(AGENTS_MD);
     let local_rtk_md = PathBuf::from(RTK_MD);
 
-    println!("rtk Configuration (Codex CLI):\n");
+    println!("{BIN} Configuration (Codex CLI):\n");
 
     if global_rtk_md.exists() {
         println!("[ok] Global RTK.md: {}", global_rtk_md.display());

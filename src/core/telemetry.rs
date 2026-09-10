@@ -496,17 +496,19 @@ mod tests {
         assert_eq!(s2.len(), 64);
     }
 
+    // Both paths are pinned to the literal directory name rather than to the
+    // constant the code reads, so a rename has to be made deliberately here too.
     #[test]
     fn test_salt_file_path_is_in_rtk_dir() {
         let path = salt_file_path();
-        assert!(path.to_string_lossy().contains(RTK_DATA_DIR));
+        assert!(path.to_string_lossy().contains("/tokenaut/"));
         assert!(path.to_string_lossy().contains(".device_salt"));
     }
 
     #[test]
     fn test_marker_path_exists() {
         let path = telemetry_marker_path();
-        assert!(path.to_string_lossy().contains(RTK_DATA_DIR));
+        assert!(path.to_string_lossy().contains("/tokenaut/"));
     }
 
     #[test]

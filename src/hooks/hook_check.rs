@@ -123,8 +123,20 @@ pub fn maybe_warn() {
     let _ = check_and_warn();
 }
 
-/// Single source of truth: delegates to `status()` then rate-limits the warning.
+/// Single source of truth: rate-limits first, then asks `status()`. The marker is
+/// read before the status check because the check stats the whole plugin cache,
+/// and this runs on every command — once the warning has fired today there is
+/// nothing left to decide, so the walk is skipped.
 fn check_and_warn() -> Option<()> {
+    let marker = warn_marker_path()?;
+    if let Ok(meta) = std::fs::metadata(&marker) {
+        if let Ok(modified) = meta.modified() {
+            if modified.elapsed().map(|e| e.as_secs()).unwrap_or(u64::MAX) < WARN_INTERVAL_SECS {
+                return Some(());
+            }
+        }
+    }
+
     let warning = match status() {
         HookStatus::Ok => return Some(()),
         HookStatus::Missing => format!(
@@ -134,16 +146,6 @@ fn check_and_warn() -> Option<()> {
             format!("[{BIN}] /!\\ Hook outdated — run `{BIN} init -g` to update")
         }
     };
-
-    // Rate limit: warn once per day
-    let marker = warn_marker_path()?;
-    if let Ok(meta) = std::fs::metadata(&marker) {
-        if let Ok(modified) = meta.modified() {
-            if modified.elapsed().map(|e| e.as_secs()).unwrap_or(u64::MAX) < WARN_INTERVAL_SECS {
-                return Some(());
-            }
-        }
-    }
 
     eprintln!("{}", warning);
 

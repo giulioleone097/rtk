@@ -1,5 +1,6 @@
 //! Compares RTK-routed vs raw commands in a coding session.
 
+use crate::core::constants::BIN;
 use crate::core::utils::format_tokens;
 use crate::discover::is_already_rtk;
 use crate::discover::provider::{ClaudeProvider, ExtractedCommand, SessionProvider};
@@ -186,7 +187,7 @@ pub fn run(_verbose: u8) -> Result<()> {
         0.0
     };
     println!("Average adoption: {:.0}%", avg_adoption);
-    println!("Tip: Run `rtk discover` to find missed RTK opportunities");
+    println!("Tip: Run `{BIN} discover` to find missed RTK opportunities");
 
     Ok(())
 }

@@ -17,6 +17,7 @@ use registry::{
 };
 use report::{DiscoverReport, SupportedEntry, UnsupportedEntry};
 
+use crate::core::constants::{BIN, LEGACY_BIN};
 use crate::core::tracking::{HookDecisionRecord, Tracker};
 use crate::discover::registry::prefix_contains_rtk_disabled;
 use crate::hooks::hook_check::{status as hook_status, HookStatus};
@@ -224,16 +225,20 @@ fn would_be_covered_without_bypass(
     estimate_hook_coverage(raw_cmd, stripped_cmd, ctx)
 }
 
-/// Whether an already-`rtk`-prefixed command counts as coverage. `rtk proxy <cmd>`
-/// deliberately runs the raw command unfiltered, so it must not count — that would
-/// let the audit flatter itself via its own escape hatch. This is ground truth read
-/// directly from the transcript (the model really did invoke `rtk`), not a guess.
+/// Whether an already-prefixed command counts as coverage. Both spellings count:
+/// a transcript predating the rename says `rtk git status`, and the hook and the
+/// exclusion list accept it too, so counting only [`BIN`] would leave those runs
+/// in the denominator and out of the numerator. `<bin> proxy <cmd>` deliberately
+/// runs the raw command unfiltered, so it must not count — that would let the
+/// audit flatter itself via its own escape hatch. This is ground truth read
+/// directly from the transcript (the model really did invoke the binary), not a
+/// guess.
 pub(crate) fn is_already_rtk(cmd: &str) -> bool {
     let trimmed = cmd.trim();
-    match trimmed.strip_prefix(crate::core::constants::BIN) {
-        Some(rest) => rest.starts_with(' ') && !rest.starts_with(" proxy"),
-        None => false,
-    }
+    [BIN, LEGACY_BIN].iter().any(|bin| {
+        matches!(trimmed.strip_prefix(bin),
+            Some(rest) if rest.starts_with(' ') && !rest.starts_with(" proxy"))
+    })
 }
 
 /// Aggregation bucket for supported commands.
@@ -785,6 +790,14 @@ mod tests {
     #[test]
     fn test_is_already_rtk_plain_rewrite() {
         assert!(is_already_rtk("tokenaut grep -n foo bar.py"));
+    }
+
+    #[test]
+    fn test_is_already_rtk_accepts_legacy_prefix() {
+        // Transcripts written before the rename say `rtk`, and the hook still
+        // accepts that spelling, so those runs are covered.
+        assert!(is_already_rtk("rtk grep -n foo bar.py"));
+        assert!(!is_already_rtk("rtk proxy grep -n foo bar.py"));
     }
 
     #[test]

@@ -52,7 +52,10 @@ impl ClaudeProvider {
         Ok(claude_dir.join("projects"))
     }
 
-    fn discover_sessions_in_projects_dir(
+    /// Every `*.jsonl` under `projects_dir`, at any depth, modified in the last
+    /// `since_days`. `pub(crate)` so `bench` measures the same corpus the audit
+    /// reads instead of keeping a second, shallower walk of its own.
+    pub(crate) fn discover_sessions_in_projects_dir(
         projects_dir: &Path,
         project_filter: Option<&str>,
         since_days: Option<u64>,
