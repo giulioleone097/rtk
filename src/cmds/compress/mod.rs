@@ -31,10 +31,10 @@ const CCR_MIN_BYTES: usize = 1024;
 
 /// A crushed part that is still above this carries a `ccr:` marker anyway, so
 /// it degrades to a head+tail excerpt plus the retrieval pointer.
-const HEAD_MAX_BYTES: usize = 1536;
+const HEAD_MAX_BYTES: usize = 768;
 /// Excerpt sizes for the head/tail kept around `[elided]`.
-const HEAD_BYTES: usize = 768;
-const TAIL_BYTES: usize = 256;
+const HEAD_BYTES: usize = 320;
+const TAIL_BYTES: usize = 96;
 /// A crushed output at least this many percent of the input is not a win.
 const MIN_WIN_PERCENT: usize = 97;
 

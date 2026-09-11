@@ -39,11 +39,15 @@ pub fn eligible_parts(body: &Value, min_bytes: usize) -> Vec<String> {
     }
 }
 
-/// Anthropic Messages shape. Eligible: `tool_result` content (string or
-/// `{type:"text"}` sub-parts) and `text` parts whose text is at least
-/// `min_bytes` — anywhere inside `messages[]` except the last
+/// Anthropic Messages shape — also covers OpenAI Chat Completions, whose
+/// `messages[]` carries the same role/content layout. Eligible: `tool_result`
+/// content (string or `{type:"text"}` sub-parts) and `text` parts whose text
+/// is at least `min_bytes` — anywhere inside `messages[]` except the last
 /// `role=="user"` message, which is the freshest human turn and stays
-/// verbatim.
+/// verbatim. `role=="system"`/`"developer"` entries stay untouched (they
+/// exist only on the chat-completions side); `role=="tool"` messages ARE
+/// eligible — they carry the same tool results Anthropic nests inside user
+/// messages.
 fn anthropic_parts(body: &Value, min_bytes: usize) -> Vec<String> {
     let mut paths = Vec::new();
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
@@ -53,7 +57,12 @@ fn anthropic_parts(body: &Value, min_bytes: usize) -> Vec<String> {
         .iter()
         .rposition(|m| m.get("role").and_then(Value::as_str) == Some("user"));
     for (i, message) in messages.iter().enumerate() {
-        if last_user == Some(i) {
+        if last_user == Some(i)
+            || matches!(
+                message.get("role").and_then(Value::as_str),
+                Some("system" | "developer")
+            )
+        {
             continue;
         }
         match message.get("content") {
@@ -116,7 +125,7 @@ pub fn process_body(body: &[u8], min_bytes: usize, crush: Crusher) -> (Vec<u8>, 
         let key = (current.len(), h.finish());
         if let Some(first) = seen.get(&key) {
             if let Some(Value::String(slot)) = doc.pointer_mut(&path) {
-                *slot = format!("↩ identical to {first} (same text, not repeated)");
+                *slot = format!("↩ same as {first}");
                 replaced += 1;
                 continue;
             }
@@ -126,6 +135,7 @@ pub fn process_body(body: &[u8], min_bytes: usize, crush: Crusher) -> (Vec<u8>, 
             replaced += 1;
         }
     }
+    replaced += drop_stale_reasoning(&mut doc);
     match serde_json::to_vec(&doc) {
         // Even with nothing crushed, a re-serialize strips pretty-print
         // whitespace the client added — a free, byte-safe win.
@@ -134,7 +144,63 @@ pub fn process_body(body: &[u8], min_bytes: usize, crush: Crusher) -> (Vec<u8>, 
     }
 }
 
-/// OpenAI Responses shape (`POST /v1/responses`, `/v1/responses/compact`):
+/// Remove reasoning state that both APIs ignore on replay.
+///
+/// Anthropic `thinking`/`redacted_thinking` blocks may be dropped from history
+/// — the API ignores them for earlier turns — EXCEPT on the assistant turn
+/// currently in flight: the thinking that produced the tool calls whose
+/// `tool_result`s sit in the last user message must survive. So every
+/// assistant message strictly before the one adjacent to the last user
+/// message loses its thinking parts.
+///
+/// OpenAI `reasoning` items before the last user message are dropped for the
+/// same reason (the freshest turn — everything from the last user message on
+/// — keeps them).
+fn drop_stale_reasoning(doc: &mut Value) -> usize {
+    let mut dropped = 0;
+    if let Some(messages) = doc.get_mut("messages").and_then(Value::as_array_mut) {
+        let last_user = messages
+            .iter()
+            .rposition(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .unwrap_or(0);
+        // The assistant message feeding the live turn stays intact.
+        let keep_from = last_user.saturating_sub(1);
+        for message in messages.iter_mut().take(keep_from) {
+            if message.get("role").and_then(Value::as_str) != Some("assistant") {
+                continue;
+            }
+            if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
+                let before = parts.len();
+                parts.retain(|part| {
+                    !matches!(
+                        part.get("type").and_then(Value::as_str),
+                        Some("thinking" | "redacted_thinking")
+                    )
+                });
+                dropped += before - parts.len();
+            }
+        }
+        return dropped;
+    }
+    if let Some(items) = doc.get_mut("input").and_then(Value::as_array_mut) {
+        let last_user = items
+            .iter()
+            .rposition(|i| {
+                i.get("type").and_then(Value::as_str) == Some("message")
+                    && i.get("role").and_then(Value::as_str) == Some("user")
+            })
+            .unwrap_or(usize::MAX);
+        let mut idx = 0usize;
+        items.retain(|item| {
+            let is_reasoning = item.get("type").and_then(Value::as_str) == Some("reasoning");
+            let drop_it = is_reasoning && idx < last_user;
+            idx += 1;
+            dropped += usize::from(drop_it);
+            !drop_it
+        });
+    }
+    dropped
+}
 /// the conversation lives in a top-level `input[]` of typed items. Eligible:
 /// `function_call_output` items' string `output` and `message` items' text
 /// content parts at least `min_bytes` long. Two carve-outs mirror the
@@ -175,6 +241,18 @@ fn responses_parts(body: &Value, min_bytes: usize) -> Vec<String> {
             Some("function_call") => {
                 if let Some(text) = item.get("arguments").and_then(Value::as_str) {
                     collect(&mut paths, format!("/input/{i}/arguments"), text, min_bytes);
+                }
+            }
+            Some("custom_tool_call" | "function_call_tool_call") => {
+                if let Some(text) = item.get("input").and_then(Value::as_str) {
+                    collect(&mut paths, format!("/input/{i}/input"), text, min_bytes);
+                }
+            }
+            Some("mcp_call") => {
+                for field in ["arguments", "output"] {
+                    if let Some(text) = item.get(field).and_then(Value::as_str) {
+                        collect(&mut paths, format!("/input/{i}/{field}"), text, min_bytes);
+                    }
                 }
             }
             Some("reasoning") => {
@@ -256,6 +334,20 @@ fn collect_part(paths: &mut Vec<String>, base: &str, part: &Value, min_bytes: us
     }
     if let Some(input) = part.get("input") {
         collect_input_strings(paths, &format!("{base}/input"), input, min_bytes);
+    }
+    // `citations` carry quoted source material (`cited_text`) that duplicates
+    // the referenced content — Anthropic keeps them on `text` parts.
+    if let Some(citations) = part.get("citations").and_then(Value::as_array) {
+        for (k, cit) in citations.iter().enumerate() {
+            if let Some(text) = cit.get("cited_text").and_then(Value::as_str) {
+                collect(
+                    paths,
+                    format!("{base}/citations/{k}/cited_text"),
+                    text,
+                    min_bytes,
+                );
+            }
+        }
     }
 }
 

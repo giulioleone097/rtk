@@ -38,15 +38,17 @@ fn forwardable(name: &str) -> bool {
 }
 
 /// The body-bearing request paths eligible for compression: Anthropic
-/// Messages plus the OpenAI Responses surface (Codex CLI routes
-/// `{base_url}/responses` here). `/v1/chat/completions` stays out on
-/// purpose: its bodies put `system`/`developer` prompts inside
-/// `messages[]`, which the walker would crush — protecting them needs a
-/// third shape, not just a path entry.
+/// Messages plus the OpenAI surfaces (Codex CLI routes `{base_url}/responses`;
+/// chat-completions clients get the same `messages[]` walker, which skips
+/// `system`/`developer` roles inside the array).
 fn compressible_path(path: &str) -> bool {
     matches!(
         path,
-        "/v1/messages" | "/v1/messages/count_tokens" | "/v1/responses" | "/v1/responses/compact"
+        "/v1/messages"
+            | "/v1/messages/count_tokens"
+            | "/v1/responses"
+            | "/v1/responses/compact"
+            | "/v1/chat/completions"
     )
 }
 

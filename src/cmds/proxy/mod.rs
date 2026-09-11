@@ -397,10 +397,12 @@ mod tests {
                 .starts_with("ccr:deadbeef"),
             "compact body went through the pipeline"
         );
-        // Chat Completions bodies carry `system` inside `messages[]`, which
-        // the walker is not shape-aware enough to spare: not compressible.
+        // Chat Completions bodies carry `system`/`developer` inside
+        // `messages[]`; the walker spares those roles and compresses the rest.
         let body = serde_json::json!({"messages": [
             {"role": "system", "content": "y".repeat(3000)},
+            {"role": "assistant", "content": "z".repeat(3000)},
+            {"role": "tool", "tool_call_id": "c1", "content": "w".repeat(3000)},
             {"role": "user", "content": "hi"}
         ]})
         .to_string();
@@ -409,11 +411,16 @@ mod tests {
             .send_bytes(body.as_bytes())
             .expect("chat/completions through proxy");
         let rec = rx.recv().expect("upstream saw chat/completions");
-        assert_eq!(
-            rec.body,
-            body.as_bytes(),
-            "chat/completions passes through byte-exact"
-        );
+        let doc: serde_json::Value = serde_json::from_slice(&rec.body).unwrap();
+        assert_eq!(doc["messages"][0]["content"], "y".repeat(3000));
+        assert!(doc["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("ccr:deadbeef"));
+        assert!(doc["messages"][2]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("ccr:deadbeef"));
     }
 
     #[test]

@@ -23,7 +23,7 @@ use std::collections::HashMap;
 /// Shapes below this many total lines are never folded.
 const MIN_TOTAL: usize = 8;
 /// Leading lines of a folded shape kept verbatim (the last is kept too).
-const KEEP: usize = 4;
+const KEEP: usize = 3;
 /// Distinct shapes tracked before giving up on new ones (bound on memory).
 const MAX_SHAPES: usize = 256;
 
@@ -137,7 +137,7 @@ mod tests {
         let out = fold_similar(&text);
         assert!(out.contains("test case_0"));
         assert!(out.contains("test case_19"));
-        assert!(out.contains("×15 more"));
+        assert!(out.contains("×16 more"));
         assert!(!out.contains("test case_10"));
     }
 
