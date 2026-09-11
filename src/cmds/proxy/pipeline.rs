@@ -13,8 +13,6 @@
 use anyhow::Result;
 use serde_json::Value;
 
-#[cfg(test)]
-use crate::cmds::compress;
 use crate::cmds::compress::Crushed;
 
 /// Signature shared by the real crusher and test fakes.
@@ -161,6 +159,20 @@ fn responses_parts(body: &Value, min_bytes: usize) -> Vec<String> {
                     collect(&mut paths, format!("/input/{i}/arguments"), text, min_bytes);
                 }
             }
+            Some("reasoning") => {
+                if let Some(summary) = item.get("summary").and_then(Value::as_array) {
+                    for (j, part) in summary.iter().enumerate() {
+                        if let Some(text) = part.get("text").and_then(Value::as_str) {
+                            collect(
+                                &mut paths,
+                                format!("/input/{i}/summary/{j}/text"),
+                                text,
+                                min_bytes,
+                            );
+                        }
+                    }
+                }
+            }
             Some("message") => {
                 if !matches!(
                     item.get("role").and_then(Value::as_str),
@@ -198,37 +210,53 @@ fn responses_parts(body: &Value, min_bytes: usize) -> Vec<String> {
     paths
 }
 
-/// One message part: `text` parts, `tool_result` content, and `tool_use`
-/// inputs — `Write.file_text`/`Edit.new_string` carry whole file bodies.
+/// One message part, walked by field name rather than part `type` so every
+/// text-bearing part is covered: `text`/`thinking` strings, `content`
+/// (string or `{type:"text"}` sub-parts — tool_result, web_search results,
+/// anything else using that shape), and `input` object's string leaves
+/// (`tool_use`/`server_tool_use`: `Write.file_text` et al carry whole file
+/// bodies). Binary payloads are safe: `image`/`document` keep data under
+/// `source`, which this never visits.
 fn collect_part(paths: &mut Vec<String>, base: &str, part: &Value, min_bytes: usize) {
-    match part.get("type").and_then(Value::as_str) {
-        Some("text") => {
-            if let Some(text) = part.get("text").and_then(Value::as_str) {
-                collect(paths, format!("{base}/text"), text, min_bytes);
+    // `thinking` deliberately excluded: its `signature` is integrity-bound to
+    // the thinking text, so a crushed thinking block fails upstream.
+    if let Some(text) = part.get("text").and_then(Value::as_str) {
+        collect(paths, format!("{base}/text"), text, min_bytes);
+    }
+    match part.get("content") {
+        Some(Value::String(text)) => {
+            collect(paths, format!("{base}/content"), text, min_bytes);
+        }
+        Some(Value::Array(subs)) => {
+            for (k, sub) in subs.iter().enumerate() {
+                if let Some(text) = sub.get("text").and_then(Value::as_str) {
+                    collect(paths, format!("{base}/content/{k}/text"), text, min_bytes);
+                }
             }
         }
-        Some("tool_result") => match part.get("content") {
-            Some(Value::String(text)) => {
-                collect(paths, format!("{base}/content"), text, min_bytes);
+        _ => {}
+    }
+    if let Some(input) = part.get("input") {
+        collect_input_strings(paths, &format!("{base}/input"), input, min_bytes);
+    }
+}
+
+/// Recurse an `input`/`arguments` JSON tree collecting every string leaf
+/// (`MultiEdit.edits[].new_string`, nested tool payloads, …). Keys needing
+/// JSON-pointer escaping are rare; `crush_at` resolves what it can and a
+/// dangling path simply stays uncompressed.
+fn collect_input_strings(paths: &mut Vec<String>, base: &str, value: &Value, min_bytes: usize) {
+    match value {
+        Value::String(text) => collect(paths, base.to_owned(), text, min_bytes),
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                collect_input_strings(paths, &format!("{base}/{i}"), item, min_bytes);
             }
-            Some(Value::Array(subs)) => {
-                for (k, sub) in subs.iter().enumerate() {
-                    if sub.get("type").and_then(Value::as_str) == Some("text") {
-                        if let Some(text) = sub.get("text").and_then(Value::as_str) {
-                            collect(paths, format!("{base}/content/{k}/text"), text, min_bytes);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        },
-        Some("tool_use") => {
-            if let Some(input) = part.get("input").and_then(Value::as_object) {
-                for (key, val) in input {
-                    if let Some(text) = val.as_str() {
-                        collect(paths, format!("{base}/input/{key}"), text, min_bytes);
-                    }
-                }
+        }
+        Value::Object(map) => {
+            for (key, val) in map {
+                let key = key.replace('~', "~0").replace('/', "~1");
+                collect_input_strings(paths, &format!("{base}/{key}"), val, min_bytes);
             }
         }
         _ => {}
@@ -442,12 +470,22 @@ mod tests {
         assert_eq!(crush_at(&mut body, "/tools/0/name", half_crusher), None);
     }
 
+    /// Crusher that never wins — the no-op contract stays testable without
+    /// depending on how `compress::crush` treats these fixtures.
+    fn identity_crusher(text: &str) -> Result<Crushed> {
+        Ok(Crushed {
+            text: text.to_owned(),
+            in_bytes: text.len(),
+            ccr: None,
+        })
+    }
+
     #[test]
     fn test_crush_at_keeps_original_when_not_smaller() {
         let mut body = fixture();
         let before = serde_json::to_vec(&body).unwrap();
         assert_eq!(
-            crush_at(&mut body, "/messages/0/content/0/content", compress::crush),
+            crush_at(&mut body, "/messages/0/content/0/content", identity_crusher),
             None
         );
         assert_eq!(serde_json::to_vec(&body).unwrap(), before);
@@ -486,7 +524,7 @@ mod tests {
     fn test_process_body_stub_is_byte_identical() {
         // The identity crusher yields nothing smaller: body forwarded as-is.
         let body = serde_json::to_vec(&fixture()).unwrap();
-        let (out, parts) = process_body(&body, 2048, compress::crush);
+        let (out, parts) = process_body(&body, 2048, identity_crusher);
         assert_eq!(parts, 0);
         assert_eq!(out, body);
     }
@@ -534,7 +572,7 @@ mod tests {
             serde_json::to_vec(&json!({"input": "single string prompt"})).unwrap(),
             serde_json::to_vec(&responses_fixture()).unwrap(),
         ] {
-            let (out, parts) = process_body(&body, 2048, compress::crush);
+            let (out, parts) = process_body(&body, 2048, identity_crusher);
             assert_eq!(parts, 0);
             assert_eq!(out, body);
         }

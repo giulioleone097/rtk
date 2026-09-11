@@ -246,7 +246,9 @@ mod tests {
         let body = serde_json::json!({
             "model": "claude-x",
             "messages": [
-                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "x".repeat(3000)}]},
+                // 900B stays under CCR_MIN_BYTES so the real crusher is a
+                // no-op here and the body round-trips byte-exact.
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "x".repeat(900)}]},
                 {"role": "user", "content": "fresh turn"}
             ]
         })
@@ -258,7 +260,7 @@ mod tests {
             .send_bytes(body.as_bytes())
             .expect("POST through proxy");
         assert_eq!(resp.status(), 200);
-        // The contract's identity stub yields nothing smaller: verbatim out.
+        // Part under the CCR floor: nothing smaller to write, verbatim out.
         let rec = rx.recv().expect("upstream saw the request");
         assert_eq!(rec.method, "POST");
         assert_eq!(rec.target, "/v1/messages");

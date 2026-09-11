@@ -25,11 +25,13 @@ use crate::cmds::mcp::store::Store;
 use crate::core::utils;
 
 /// Originals at least this many bytes get a CCR retrieval marker when crushed.
-const CCR_MIN_BYTES: usize = 4096;
+/// 1 KiB: the index write is one FTS row, and it buys retrieval safety plus
+/// the head/tail excerpt path even on parts the crushers cannot shrink.
+const CCR_MIN_BYTES: usize = 1024;
 
 /// A crushed part that is still above this carries a `ccr:` marker anyway, so
 /// it degrades to a head+tail excerpt plus the retrieval pointer.
-const HEAD_MAX_BYTES: usize = 3 * 1024;
+const HEAD_MAX_BYTES: usize = 1536;
 /// Excerpt sizes for the head/tail kept around `[elided]`.
 const HEAD_BYTES: usize = 768;
 const TAIL_BYTES: usize = 256;
@@ -203,7 +205,10 @@ fn crush_inner(text: &str, store: Option<&Store>) -> Result<Crushed> {
         in_bytes,
         ccr: None,
     };
-    if in_bytes >= CCR_MIN_BYTES && crushed.text.len() < in_bytes {
+    // Index unconditionally above CCR_MIN_BYTES: even an uncrushable part
+    // gets the head/tail excerpt + marker once it's in the index, and the
+    // marker append can never be applied without an index entry behind it.
+    if in_bytes >= CCR_MIN_BYTES {
         if let Some(store) = store {
             let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
             let source = format!("ccr:{}", &digest[..12]);
@@ -327,6 +332,23 @@ mod tests {
             "no section with original content under {ccr}: {} hit(s)",
             sections.len()
         );
+    }
+
+    #[test]
+    fn ccr_uncrushable_part_degrades_to_excerpt() {
+        let (_dir, store) = temp_store();
+        // Words no crusher can shrink, over HEAD_MAX so the excerpt kicks in.
+        let input = (0..160)
+            .map(|i| format!("w{:x}token{:x} ", i, i * 7))
+            .collect::<String>();
+        assert!(input.len() >= CCR_MIN_BYTES && input.len() > HEAD_MAX_BYTES);
+        let out = crush_with(&input, &store).unwrap();
+        assert!(out.ccr.is_some());
+        assert!(out.text.contains("[elided]"), "{}", out.text);
+        assert!(out.text.len() < HEAD_MAX_BYTES + 300, "{}", out.text.len());
+        // And the original is still searchable.
+        let ccr = out.ccr.unwrap();
+        assert!(!store.search(&ccr, 5, None).unwrap().is_empty());
     }
 
     #[test]
