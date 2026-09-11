@@ -71,11 +71,11 @@ pub fn crush_at(body: &mut Value, path: &str, crush: Crusher) -> Option<CrushedP
         Value::String(s) => s,
         _ => return None,
     };
-    let in_bytes = slot.len();
     let out = crush(slot).ok()?;
-    if out.text.len() >= in_bytes {
+    if out.text.len() >= slot.len() {
         return None;
     }
+    let in_bytes = out.in_bytes;
     *slot = out.text;
     Some((in_bytes, slot.len()))
 }

@@ -930,6 +930,20 @@ enum Commands {
     },
     /// Run the MCP server over stdio (tools: ctx_batch_execute, ctx_search)
     Mcp,
+
+    /// Transparent Anthropic API proxy that compresses resent history
+    /// (opt-in: point Claude Code at it via ANTHROPIC_BASE_URL)
+    ApiProxy {
+        /// Address to listen on
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        listen: String,
+        /// Upstream API base URL
+        #[arg(long, default_value = "https://api.anthropic.com")]
+        upstream: String,
+        /// Smallest message-part length in bytes eligible for compression
+        #[arg(long, default_value_t = 1024)]
+        min_bytes: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2755,6 +2769,18 @@ fn run_cli() -> Result<i32> {
             }
         }
         Commands::Mcp => cmds::mcp::run()?,
+        Commands::ApiProxy {
+            listen,
+            upstream,
+            min_bytes,
+        } => {
+            cmds::proxy::run(cmds::proxy::ProxyConfig {
+                listen,
+                upstream,
+                min_bytes,
+            })?;
+            0
+        }
 
         Commands::Rewrite { args } => {
             let cmd = args.join(" ");

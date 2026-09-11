@@ -1,4 +1,4 @@
-//! `tokenaut proxy`: a transparent HTTP/1.1 forward proxy for the Anthropic
+//! `tokenaut api-proxy`: a transparent HTTP/1.1 forward proxy for the Anthropic
 //! API. Claude Code pointed at `ANTHROPIC_BASE_URL=http://127.0.0.1:8787`
 //! gets identical API behavior while old, large `messages[]` content is
 //! compressed through [`crate::cmds::compress`] before it goes upstream.
@@ -14,10 +14,6 @@
 //! is byte-exact passthrough: headers minus hop-by-hop, status and body
 //! streamed back incrementally — Anthropic's `text/event-stream` responses
 //! are chunk-copied upstream→client, never buffered whole.
-// Everything here is dead code until the lead wires the `proxy` subcommand;
-// tests exercise it end-to-end in the meantime.
-#![allow(dead_code)]
-
 mod forward;
 mod pipeline;
 
@@ -37,7 +33,7 @@ pub struct ProxyConfig {
     pub min_bytes: usize,
 }
 
-/// `tokenaut proxy` entry point — blocking.
+/// `tokenaut api-proxy` entry point — blocking.
 pub fn run(cfg: ProxyConfig) -> Result<()> {
     let (server, addr) = listen(&cfg.listen)?;
     eprintln!(

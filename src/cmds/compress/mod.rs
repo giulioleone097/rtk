@@ -9,10 +9,6 @@
 //!   input and index state must produce the same output, so a request prefix
 //!   stays byte-identical between turns and prompt caching keeps working.
 
-// Dead code until `src/cmds/proxy` merges and calls the contract; the allow
-// comes off with that merge.
-#![allow(dead_code)]
-
 mod code;
 mod json;
 mod log;
@@ -167,6 +163,7 @@ pub fn crush(text: &str) -> Result<Crushed> {
 }
 
 /// [`crush`] against a caller-provided index — tests keep it on a tempdir.
+#[cfg(test)]
 pub(crate) fn crush_with(text: &str, store: &Store) -> Result<Crushed> {
     crush_inner(text, Some(store))
 }
