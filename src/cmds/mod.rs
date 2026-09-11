@@ -10,6 +10,7 @@ pub mod js;
 pub mod jvm;
 pub mod mcp;
 pub mod php;
+pub mod proxy;
 pub mod python;
 pub mod ruby;
 pub mod rust;

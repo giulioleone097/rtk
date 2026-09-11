@@ -36,6 +36,11 @@ chrono = "0.4"
 tempfile = "3"
 sha2 = "0.10"
 ureq = "2"
+# Synchronous HTTP/1.1 server for `tokenaut proxy`: one thread per connection
+# keeps the no-async rule, and `Request::into_writer` hands us the raw client
+# socket so SSE responses stream incrementally (its `Response` chunked
+# encoder batches 8 KiB, which would stall `text/event-stream`).
+tiny_http = "0.12"
 url = "2.5"
 getrandom = "0.4"
 flate2 = "1.0"
