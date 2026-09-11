@@ -1,7 +1,9 @@
 //! Near-duplicate line folding: the pass the exact-match fold cannot do.
 //!
-//! A line's *shape* is the line with every run of digits replaced by `#`
-//! (`test tests::case_42 ... ok` → `test tests::case_# ... ok`). Cargo,
+//! A line's *shape* is the line with every alphanumeric word that contains a
+//! digit replaced by `#` (`test tests::case_42 ... ok` and
+//! `commit a1b2c3d fixed` → shapes ending `case_#` / `commit # fixed`).
+//! Numbered names, hex ids, uuids and versions all collapse to one shape.
 //! pytest, generated code and logs emit hundreds of lines that differ only in
 //! counters. When one shape appears at least [`MIN_TOTAL`] times, its first
 //! [`KEEP`] lines and its final line stay verbatim, the middle lines drop,
@@ -31,20 +33,31 @@ fn shape_of(line: &str) -> Option<String> {
         return None;
     }
     let mut shape = String::with_capacity(line.len());
-    let mut digits = 0usize;
+    let mut word = String::new();
+    let mut word_has_digit = false;
     for ch in line.chars() {
-        if ch.is_ascii_digit() {
-            digits += 1;
+        if ch.is_alphanumeric() {
+            word.push(ch);
+            word_has_digit |= ch.is_ascii_digit();
         } else {
-            if digits > 0 {
-                shape.push('#');
-                digits = 0;
+            if !word.is_empty() {
+                if word_has_digit {
+                    shape.push('#');
+                } else {
+                    shape.push_str(&word);
+                }
+                word.clear();
+                word_has_digit = false;
             }
             shape.push(ch);
         }
     }
-    if digits > 0 {
-        shape.push('#');
+    if !word.is_empty() {
+        if word_has_digit {
+            shape.push('#');
+        } else {
+            shape.push_str(&word);
+        }
     }
     Some(shape)
 }
@@ -134,8 +147,8 @@ mod tests {
             .map(|i| format!("Compiling dep{i} v1.{i}.0\ntest tests::case_{i} ... ok\n"))
             .collect();
         let out = fold_similar(&text);
-        assert!(out.contains("Compiling dep# v#.#.#"));
-        assert!(out.contains("case_#"));
+        assert!(out.contains("Compiling # #.#.#"), "{out}");
+        assert!(out.contains("case_#"), "{out}");
     }
 
     #[test]
