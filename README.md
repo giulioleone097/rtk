@@ -6,7 +6,10 @@ binary and the config directory are named `tokenaut`: rewritten commands are spe
 `<platform config dir>/tokenaut` (an existing `rtk` directory is copied over on first run). It adds
 `tokenaut bench`, which replays candidate filters over recent Claude Code transcripts, and
 `tokenaut bench --gaps`, which ranks the Bash producers whose bytes the rewrite engine does not
-capture. Everything below is the upstream rtk README, unchanged.
+capture, and `tokenaut bench --history`, which measures how much of each API request is resent
+conversation history versus fresh output — the activation gate for `tokenaut proxy`, an opt-in
+transparent proxy that compresses the resend (see the `Commands` section). Everything below is the
+upstream rtk README, unchanged.
 
 ---
 
