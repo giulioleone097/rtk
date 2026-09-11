@@ -2,7 +2,7 @@
 
 mod exec;
 mod fetch;
-mod store;
+pub(crate) mod store;
 mod tools;
 
 use anyhow::{Context, Result};

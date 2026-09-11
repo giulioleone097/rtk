@@ -2,6 +2,7 @@
 
 pub mod bench;
 pub mod cloud;
+pub mod compress;
 pub mod dotnet;
 pub mod git;
 pub mod go;
