@@ -76,13 +76,15 @@ pub struct ExecuteFileInput {
     pub cwd: Option<String>,
 }
 
-/// One supported runtime: what runs the script, what the script is called, and
-/// the preamble that hands `FILE_CONTENT` to a `ctx_execute_file` script.
+/// One supported runtime: what runs the script, what the script is called,
+/// the preamble that hands `FILE_CONTENT` to a `ctx_execute_file` script, and
+/// the environment the script runs under.
 struct Language {
     name: &'static str,
     interpreter: &'static str,
     suffix: &'static str,
     file_preamble: &'static str,
+    env: &'static [(&'static str, &'static str)],
 }
 
 /// The three runtimes the corpus actually asks for.
@@ -92,6 +94,7 @@ const LANGUAGES: &[Language] = &[
         interpreter: "bash",
         suffix: "sh",
         file_preamble: "FILE_CONTENT=$(cat \"$FILE_PATH\")\n",
+        env: &[],
     },
     Language {
         name: "javascript",
@@ -100,6 +103,7 @@ const LANGUAGES: &[Language] = &[
         // directory would make node read the script as ESM, and `require` fail.
         suffix: "cjs",
         file_preamble: "const FILE_CONTENT = require(\"fs\").readFileSync(process.env.FILE_PATH, \"utf8\");\n",
+        env: &[],
     },
     Language {
         name: "python",
@@ -107,6 +111,9 @@ const LANGUAGES: &[Language] = &[
         suffix: "py",
         file_preamble:
             "import os\nFILE_CONTENT = open(os.environ[\"FILE_PATH\"], encoding=\"utf-8\", errors=\"replace\").read()\n",
+        // Python block-buffers stdout on a pipe: a call that hits the capture
+        // cap or its timeout would lose the script's last prints.
+        env: &[("PYTHONUNBUFFERED", "1")],
     },
 ];
 
@@ -115,6 +122,17 @@ fn language(name: &str) -> Result<&'static Language> {
         .iter()
         .find(|language| language.name == name)
         .with_context(|| format!("unsupported language: {name} (shell, javascript or python)"))
+}
+
+impl Language {
+    /// The variables a script under this runtime always runs with; the call's
+    /// own (like `FILE_PATH`) come on top.
+    fn env(&self) -> Vec<(&'static str, String)> {
+        self.env
+            .iter()
+            .map(|(name, value)| (*name, (*value).to_string()))
+            .collect()
+    }
 }
 
 /// One prepared call: what to run, what the script needs in its environment,
@@ -138,7 +156,7 @@ impl Job {
         Ok(Job {
             language,
             code: input.code.clone(),
-            env: Vec::new(),
+            env: language.env(),
             source: format!("execute:{}:{}", language.name, call_id(&input.code)),
         })
     }
@@ -152,10 +170,12 @@ impl Job {
             Ok(path) => path,
             Err(answer) => return Ok(Err(answer)),
         };
+        let mut env = language.env();
+        env.push(("FILE_PATH", path.display().to_string()));
         Ok(Ok(Job {
             language,
             code: format!("{}{}", language.file_preamble, input.code),
-            env: vec![("FILE_PATH", path.display().to_string())],
+            env,
             source: format!("file:{}", path.display()),
         }))
     }
@@ -620,5 +640,39 @@ mod tests {
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(dir.path()), 0o700, "the directory is not private");
         assert_eq!(mode(&script), 0o600, "the script is not private");
+    }
+
+    #[test]
+    fn a_python_script_runs_with_stdout_unbuffered() {
+        if which::which("python3").is_err() {
+            return;
+        }
+        let out = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(execute(snippet(
+                "python",
+                "import os; print(os.environ.get(\"PYTHONUNBUFFERED\"))",
+            )))
+            .unwrap();
+        assert_eq!(out, "exit 0, 2 bytes\n1\n");
+
+        // A `ctx_execute_file` job runs under the same set.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.txt");
+        std::fs::write(&path, "x").unwrap();
+        let file = ExecuteFileInput {
+            path: path.display().to_string(),
+            language: "python".to_string(),
+            code: "print(FILE_CONTENT)".to_string(),
+            timeout_ms: None,
+            intent: None,
+            cwd: None,
+        };
+        let job = Job::file(&file, &working_dir(None).unwrap())
+            .unwrap()
+            .expect("the file is there");
+        assert!(job.env.contains(&("PYTHONUNBUFFERED", "1".to_string())));
     }
 }
