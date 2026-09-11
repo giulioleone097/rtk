@@ -1,19 +1,22 @@
-//! `tokenaut api-proxy`: a transparent HTTP/1.1 forward proxy for the Anthropic
-//! API. Claude Code pointed at `ANTHROPIC_BASE_URL=http://127.0.0.1:8787`
-//! gets identical API behavior while old, large `messages[]` content is
-//! compressed through [`crate::cmds::compress`] before it goes upstream.
+//! `tokenaut api-proxy`: a transparent HTTP/1.1 forward proxy for the
+//! Anthropic and OpenAI Responses APIs. Claude Code pointed at
+//! `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` — or Codex pointed at the
+//! same URL through a `[model_providers]` `base_url` — gets identical API
+//! behavior while old, large `messages[]`/`input[]` content is compressed
+//! through [`crate::cmds::compress`] before it goes upstream.
 //!
 //! Cache alignment invariant: `compress::crush` is deterministic, so a part
 //! compressed in turn N compresses to the same bytes in turn N+1 — the
 //! request prefix reaching upstream stays byte-stable and prompt caching
-//! survives. To preserve it the pipeline never reorders `messages`, never
-//! touches `system`, `tools` or `cache_control`, and only rewrites eligible
-//! text fields in place.
+//! survives. To preserve it the pipeline never reorders `messages`/`input`,
+//! never touches `system`, `instructions`, `tools` or `cache_control`, and
+//! only rewrites eligible text fields in place.
 //!
-//! Everything besides POST `/v1/messages` (and `/v1/messages/count_tokens`)
-//! is byte-exact passthrough: headers minus hop-by-hop, status and body
-//! streamed back incrementally — Anthropic's `text/event-stream` responses
-//! are chunk-copied upstream→client, never buffered whole.
+//! Everything besides POST `/v1/messages`, `/v1/messages/count_tokens`,
+//! `/v1/responses` and `/v1/responses/compact` is byte-exact passthrough:
+//! headers minus hop-by-hop, status and body streamed back incrementally —
+//! `text/event-stream` responses are chunk-copied upstream→client, never
+//! buffered whole.
 mod forward;
 mod pipeline;
 
@@ -330,6 +333,84 @@ mod tests {
             rec.body,
             body.as_bytes(),
             "non-messages paths pass through byte-exact"
+        );
+    }
+
+    #[test]
+    fn test_post_responses_crushes_eligible_parts_only() {
+        let (up_addr, rx) = spawn_upstream();
+        let proxy = spawn_proxy_with(up_addr, quarter);
+        let fresh = format!("fresh {}", "u".repeat(3000));
+        let body = serde_json::json!({
+            "instructions": "sys",
+            "input": [
+                {"type": "function_call_output", "call_id": "c1", "output": "x".repeat(3000)},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": fresh}]},
+                {"type": "function_call_output", "call_id": "c2", "output": "y".repeat(3000)}
+            ]
+        })
+        .to_string();
+        client()
+            .post(&format!("http://{proxy}/v1/responses"))
+            .set("content-type", "application/json")
+            .send_bytes(body.as_bytes())
+            .expect("POST through proxy");
+        let rec = rx.recv().expect("upstream saw the request");
+        let doc: serde_json::Value =
+            serde_json::from_slice(&rec.body).expect("upstream body is valid JSON");
+        assert!(
+            doc["input"][0]["output"]
+                .as_str()
+                .unwrap()
+                .starts_with("ccr:deadbeef xxxx"),
+            "old function_call_output crushed: {}",
+            doc["input"][0]["output"]
+        );
+        // The freshest turn — the last user message and the tool output
+        // trailing it — stays verbatim; `instructions` untouched.
+        assert_eq!(doc["input"][1]["content"][0]["text"], fresh);
+        assert_eq!(doc["input"][2]["output"], "y".repeat(3000));
+        assert_eq!(doc["instructions"], "sys");
+    }
+
+    #[test]
+    fn test_responses_compact_compressible_chat_completions_passthrough() {
+        let (up_addr, rx) = spawn_upstream();
+        let proxy = spawn_proxy_with(up_addr, quarter);
+        let body = serde_json::json!({"input": [
+            {"type": "function_call_output", "call_id": "c", "output": "y".repeat(3000)},
+            {"type": "message", "role": "user", "content": "hi"}
+        ]})
+        .to_string();
+        client()
+            .post(&format!("http://{proxy}/v1/responses/compact"))
+            .send_bytes(body.as_bytes())
+            .expect("compact through proxy");
+        let rec = rx.recv().expect("upstream saw compact");
+        let doc: serde_json::Value = serde_json::from_slice(&rec.body).unwrap();
+        assert!(
+            doc["input"][0]["output"]
+                .as_str()
+                .unwrap()
+                .starts_with("ccr:deadbeef"),
+            "compact body went through the pipeline"
+        );
+        // Chat Completions bodies carry `system` inside `messages[]`, which
+        // the walker is not shape-aware enough to spare: not compressible.
+        let body = serde_json::json!({"messages": [
+            {"role": "system", "content": "y".repeat(3000)},
+            {"role": "user", "content": "hi"}
+        ]})
+        .to_string();
+        client()
+            .post(&format!("http://{proxy}/v1/chat/completions"))
+            .send_bytes(body.as_bytes())
+            .expect("chat/completions through proxy");
+        let rec = rx.recv().expect("upstream saw chat/completions");
+        assert_eq!(
+            rec.body,
+            body.as_bytes(),
+            "chat/completions passes through byte-exact"
         );
     }
 

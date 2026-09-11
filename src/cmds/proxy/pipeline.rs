@@ -1,13 +1,14 @@
-//! Request-body compression stage: find compressible `messages[]` parts and
-//! route each through [`crate::cmds::compress::crush`].
+//! Request-body compression stage: find compressible `messages[]`/`input[]`
+//! parts and route each through [`crate::cmds::compress::crush`].
 //!
 //! Cache alignment: `crush` is deterministic, so a part compressed in turn N
 //! produces identical bytes in turn N+1 — the request prefix that reaches
 //! upstream stays byte-stable and prompt caching keeps working. To preserve
 //! the invariant this module only rewrites eligible text fields in place: it
-//! never reorders `messages` and never touches `system`, `tools` or
-//! `cache_control`. A part already carrying a `ccr:` retrieval marker is
-//! skipped, so a compressed part round-trips unchanged.
+//! never reorders `messages`/`input` and never touches `system`,
+//! `instructions`, `tools` or `cache_control`. A part already carrying a
+//! `ccr:` retrieval marker is skipped, so a compressed part round-trips
+//! unchanged.
 
 use anyhow::Result;
 use serde_json::Value;
@@ -24,11 +25,25 @@ pub type CrushedPart = (usize, usize);
 
 /// JSON-pointer paths of every compressible text field in the request body.
 ///
-/// Eligible: `tool_result` content (string or `{type:"text"}` sub-parts) and
-/// `text` parts whose text is at least `min_bytes` — anywhere inside
-/// `messages[]` except the last `role=="user"` message, which is the freshest
-/// human turn and stays verbatim.
+/// Two API shapes dispatch on their body field: Anthropic `messages[]`
+/// ([`anthropic_parts`]) and OpenAI Responses `input[]` ([`responses_parts`]).
+/// A `messages` field wins when both are present — Anthropic-shaped bodies
+/// walk exactly as before. A body matching neither shape yields no paths,
+/// so [`process_body`] forwards it byte-identical.
 pub fn eligible_parts(body: &Value, min_bytes: usize) -> Vec<String> {
+    if body.get("messages").and_then(Value::as_array).is_some() {
+        anthropic_parts(body, min_bytes)
+    } else {
+        responses_parts(body, min_bytes)
+    }
+}
+
+/// Anthropic Messages shape. Eligible: `tool_result` content (string or
+/// `{type:"text"}` sub-parts) and `text` parts whose text is at least
+/// `min_bytes` — anywhere inside `messages[]` except the last
+/// `role=="user"` message, which is the freshest human turn and stays
+/// verbatim.
+fn anthropic_parts(body: &Value, min_bytes: usize) -> Vec<String> {
     let mut paths = Vec::new();
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
         return paths;
@@ -101,6 +116,81 @@ pub fn process_body(body: &[u8], min_bytes: usize, crush: Crusher) -> (Vec<u8>, 
         Ok(bytes) => (bytes, replaced),
         Err(_) => (body.to_vec(), 0),
     }
+}
+
+/// OpenAI Responses shape (`POST /v1/responses`, `/v1/responses/compact`):
+/// the conversation lives in a top-level `input[]` of typed items. Eligible:
+/// `function_call_output` items' string `output` and `message` items' text
+/// content parts at least `min_bytes` long. Two carve-outs mirror the
+/// Anthropic walker's invariants:
+///
+/// - Everything from the last `role=="user"` message item to the end of the
+///   array stays verbatim. In this shape the freshest turn spans items —
+///   `function_call_output`s trailing that message are this turn's tool
+///   results, the same thing the Anthropic rule protects inside the last
+///   user message.
+/// - `system`/`developer` messages are never touched: the Anthropic side
+///   keeps `system` safe as a top-level field, and `instructions` is the
+///   equivalent top-level field here — input messages carrying those roles
+///   get the same protection. `instructions`, `tools` and every other
+///   top-level field are never visited by construction.
+// ceiling: `function_call_output.output` only in its string form — the
+// list-of-parts form is legal but rare (Codex sends a string), and those
+// items just pass through uncompressed.
+fn responses_parts(body: &Value, min_bytes: usize) -> Vec<String> {
+    let mut paths = Vec::new();
+    let Some(items) = body.get("input").and_then(Value::as_array) else {
+        return paths;
+    };
+    let last_user = items.iter().rposition(|item| {
+        item.get("type").and_then(Value::as_str) == Some("message")
+            && item.get("role").and_then(Value::as_str) == Some("user")
+    });
+    for (i, item) in items.iter().enumerate() {
+        if last_user.is_some_and(|lu| i >= lu) {
+            break;
+        }
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call_output") => {
+                if let Some(text) = item.get("output").and_then(Value::as_str) {
+                    collect(&mut paths, format!("/input/{i}/output"), text, min_bytes);
+                }
+            }
+            Some("message") => {
+                if !matches!(
+                    item.get("role").and_then(Value::as_str),
+                    Some("user" | "assistant")
+                ) {
+                    continue;
+                }
+                match item.get("content") {
+                    Some(Value::String(text)) => {
+                        collect(&mut paths, format!("/input/{i}/content"), text, min_bytes);
+                    }
+                    Some(Value::Array(parts)) => {
+                        for (j, part) in parts.iter().enumerate() {
+                            if matches!(
+                                part.get("type").and_then(Value::as_str),
+                                Some("input_text" | "output_text" | "text")
+                            ) {
+                                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                    collect(
+                                        &mut paths,
+                                        format!("/input/{i}/content/{j}/text"),
+                                        text,
+                                        min_bytes,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    paths
 }
 
 /// One message part: `text` parts and `tool_result` content.
@@ -215,6 +305,88 @@ mod tests {
         assert_eq!(eligible_parts(&body, 2048), vec!["/messages/0/content"]);
     }
 
+    /// OpenAI Responses shape: `instructions`/`tools` untouched, old
+    /// `function_call_output` and message text parts eligible, and the tail
+    /// starting at the last `role=="user"` message — the freshest turn —
+    /// stays verbatim.
+    fn responses_fixture() -> Value {
+        json!({
+            "instructions": big("instr"),
+            "input": [
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": big("dev")}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": big("u1")}]},
+                {"type": "function_call_output", "call_id": "c1", "output": big("fco")},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": big("a1")}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": big("u2")}]},
+                {"type": "function_call_output", "call_id": "c2", "output": big("tail-fco")},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": big("sum")}]}
+            ],
+            "tools": [{"type": "function", "name": "exec"}]
+        })
+    }
+
+    #[test]
+    fn test_eligible_parts_responses_fixture() {
+        let paths = eligible_parts(&responses_fixture(), 2048);
+        // The old user text, the old function_call_output and the old
+        // assistant text. The developer message, `instructions`, `tools`,
+        // the reasoning summary, and the whole tail from the last user
+        // message on (including `tail-fco`) are untouched.
+        assert_eq!(
+            paths,
+            vec![
+                "/input/1/content/0/text",
+                "/input/2/output",
+                "/input/3/content/0/text",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_eligible_parts_responses_string_content_and_min_bytes() {
+        let body = json!({"input": [
+            {"type": "message", "role": "user", "content": big("old-question")},
+            {"type": "function_call_output", "call_id": "c", "output": "tiny"},
+            {"type": "message", "role": "user", "content": big("fresh")}
+        ]});
+        assert_eq!(eligible_parts(&body, 2048), vec!["/input/0/content"]);
+        // A `function_call_output` ending the array is the current turn's
+        // freshest tool result: it stays verbatim like an Anthropic
+        // tool_result inside the last user message.
+        let body = json!({"input": [
+            {"type": "function_call_output", "call_id": "old", "output": big("stale")},
+            {"type": "message", "role": "user", "content": "go"},
+            {"type": "function_call_output", "call_id": "new", "output": big("just-ran")}
+        ]});
+        assert_eq!(eligible_parts(&body, 2048), vec!["/input/0/output"]);
+    }
+
+    #[test]
+    fn test_eligible_parts_responses_skips() {
+        // `input` as a plain string (single-prompt form) and bodies matching
+        // neither shape produce no paths.
+        assert!(eligible_parts(&json!({"input": "hi"}), 1).is_empty());
+        assert!(eligible_parts(&json!({"foo": 1}), 1).is_empty());
+        // system/developer messages stay verbatim like Anthropic `system`.
+        let body = json!({"input": [
+            {"type": "message", "role": "system", "content": [{"type": "input_text", "text": big("sys")}]},
+            {"type": "message", "role": "user", "content": "hi"}
+        ]});
+        assert!(eligible_parts(&body, 1).is_empty());
+        // Already-compressed parts are not re-crushed.
+        let marked = json!({"input": [
+            {"type": "function_call_output", "call_id": "c", "output": "ccr:9f1a 2000 bytes indexed"},
+            {"type": "message", "role": "user", "content": "hi"}
+        ]});
+        assert!(eligible_parts(&marked, 1).is_empty());
+        // Anthropic shape still wins when both fields are present.
+        let both = json!({
+            "messages": [{"role": "assistant", "content": big("m")}, {"role": "user", "content": "x"}],
+            "input": [{"type": "function_call_output", "call_id": "c", "output": big("i")}]
+        });
+        assert_eq!(eligible_parts(&both, 2048), vec!["/messages/0/content"]);
+    }
+
     #[test]
     fn test_eligible_parts_no_messages_or_marked() {
         assert!(eligible_parts(&json!({}), 1).is_empty());
@@ -301,5 +473,54 @@ mod tests {
         let (out, parts) = process_body(&body, 2048, compress::crush);
         assert_eq!(parts, 0);
         assert_eq!(out, body);
+    }
+
+    #[test]
+    fn test_crush_at_responses_paths() {
+        let mut body = responses_fixture();
+        let replaced = crush_at(&mut body, "/input/2/output", half_crusher);
+        assert_eq!(replaced, Some((3004, 3004 / 4 + 13)));
+        assert!(body["input"][2]["output"]
+            .as_str()
+            .unwrap()
+            .starts_with("ccr:deadbeef fco:"));
+        assert_eq!(
+            crush_at(&mut body, "/input/1/content/0/text", half_crusher),
+            Some((3003, 3003 / 4 + 13))
+        );
+        // Missing path / non-string slot: nothing happens.
+        assert_eq!(crush_at(&mut body, "/input/9/output", half_crusher), None);
+        assert_eq!(crush_at(&mut body, "/tools/0/name", half_crusher), None);
+    }
+
+    #[test]
+    fn test_process_body_responses_end_to_end() {
+        let body = serde_json::to_vec(&responses_fixture()).unwrap();
+        let (out, parts) = process_body(&body, 2048, half_crusher);
+        assert_eq!(parts, 3);
+        let doc: Value = serde_json::from_slice(&out).unwrap();
+        assert!(doc["input"][2]["output"]
+            .as_str()
+            .unwrap()
+            .starts_with("ccr:deadbeef fco:"));
+        // instructions, the freshest turn and untouched top-level fields.
+        assert_eq!(doc["instructions"], big("instr"));
+        assert_eq!(doc["input"][4]["content"][0]["text"], big("u2"));
+        assert_eq!(doc["input"][5]["output"], big("tail-fco"));
+        assert_eq!(doc["tools"][0]["name"], "exec");
+    }
+
+    #[test]
+    fn test_process_body_neither_shape_is_byte_identical() {
+        // Parses fine but matches neither `messages` nor `input` shape.
+        for body in [
+            serde_json::to_vec(&json!({"foo": {"bar": big("x")}})).unwrap(),
+            serde_json::to_vec(&json!({"input": "single string prompt"})).unwrap(),
+            serde_json::to_vec(&responses_fixture()).unwrap(),
+        ] {
+            let (out, parts) = process_body(&body, 2048, compress::crush);
+            assert_eq!(parts, 0);
+            assert_eq!(out, body);
+        }
     }
 }
