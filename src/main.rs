@@ -924,6 +924,9 @@ enum Commands {
         /// Report the not-rewritten Bash producers by bytes instead
         #[arg(long)]
         gaps: bool,
+        /// Measure history-vs-fresh request bytes (the proxy activation gate)
+        #[arg(long)]
+        history: bool,
     },
     /// Run the MCP server over stdio (tools: ctx_batch_execute, ctx_search)
     Mcp,
@@ -2741,10 +2744,15 @@ fn run_cli() -> Result<i32> {
             days,
             config_dir,
             gaps,
+            history,
         } => {
             // A lost citation is a failing bench, not an error the CLI should
             // print a message for, so the exit code is returned directly.
-            cmds::bench::run(days, &config_dir, gaps)
+            if history {
+                cmds::bench::history::run_history(days, &config_dir)?
+            } else {
+                cmds::bench::run(days, &config_dir, gaps)
+            }
         }
         Commands::Mcp => cmds::mcp::run()?,
 

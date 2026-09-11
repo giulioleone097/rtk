@@ -3,10 +3,7 @@
 //! later step reproduced verbatim is removed.
 
 mod filters;
-/// `bench --history`: history-vs-fresh request bytes. The lead wires `--history`
-/// into main.rs once all bench slices land; until then nothing reachable from
-/// `main` calls it, which would trip the workspace's `warnings = "deny"`.
-#[allow(dead_code)]
+/// `bench --history`: history-vs-fresh request bytes (the proxy gate).
 pub mod history;
 
 use regex::Regex;
