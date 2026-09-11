@@ -1,7 +1,7 @@
-//! Forward one client request to the upstream Anthropic API and stream the
-//! response back. Everything is byte-exact passthrough except POST
-//! `/v1/messages` and `/v1/messages/count_tokens`, whose bodies go through
-//! [`pipeline`] first.
+//! Forward one client request to the upstream Anthropic/OpenAI API and
+//! stream the response back. Everything is byte-exact passthrough except
+//! POST `/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses` and
+//! `/v1/responses/compact`, whose bodies go through [`pipeline`] first.
 
 use std::io::{self, Read, Write};
 
@@ -37,9 +37,17 @@ fn forwardable(name: &str) -> bool {
     !name.starts_with("proxy-") && !HOP_BY_HOP.contains(&name.as_str())
 }
 
-/// The body-bearing request paths eligible for compression.
+/// The body-bearing request paths eligible for compression: Anthropic
+/// Messages plus the OpenAI Responses surface (Codex CLI routes
+/// `{base_url}/responses` here). `/v1/chat/completions` stays out on
+/// purpose: its bodies put `system`/`developer` prompts inside
+/// `messages[]`, which the walker would crush — protecting them needs a
+/// third shape, not just a path entry.
 fn compressible_path(path: &str) -> bool {
-    path == "/v1/messages" || path == "/v1/messages/count_tokens"
+    matches!(
+        path,
+        "/v1/messages" | "/v1/messages/count_tokens" | "/v1/responses" | "/v1/responses/compact"
+    )
 }
 
 /// Path plus query of a request target: origin-form is already that; an
