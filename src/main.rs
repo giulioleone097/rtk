@@ -927,6 +927,13 @@ enum Commands {
         /// Measure history-vs-fresh request bytes (the proxy activation gate)
         #[arg(long)]
         history: bool,
+        /// Measure proxy pipeline compression over a corpus of request bodies
+        /// (.json bodies or .jsonl, one body per line, body or {"body": ..})
+        #[arg(long = "compress", num_args = 1..)]
+        compress_corpus: Vec<PathBuf>,
+        /// Smallest message-part length eligible for compression (--compress)
+        #[arg(long, default_value_t = 1024)]
+        min_bytes: usize,
     },
     /// Run the MCP server over stdio (tools: ctx_batch_execute, ctx_search)
     Mcp,
@@ -2771,10 +2778,14 @@ fn run_cli() -> Result<i32> {
             config_dir,
             gaps,
             history,
+            compress_corpus,
+            min_bytes,
         } => {
             // A lost citation is a failing bench, not an error the CLI should
             // print a message for, so the exit code is returned directly.
-            if history {
+            if !compress_corpus.is_empty() {
+                cmds::bench::compress::run(&compress_corpus, min_bytes)?
+            } else if history {
                 cmds::bench::history::run_history(days, &config_dir)?
             } else {
                 cmds::bench::run(days, &config_dir, gaps)

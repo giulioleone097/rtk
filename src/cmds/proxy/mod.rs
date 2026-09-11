@@ -18,7 +18,7 @@
 //! `text/event-stream` responses are chunk-copied upstream→client, never
 //! buffered whole.
 mod forward;
-mod pipeline;
+pub(crate) mod pipeline;
 
 use std::net::SocketAddr;
 use std::thread;

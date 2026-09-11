@@ -156,6 +156,11 @@ fn responses_parts(body: &Value, min_bytes: usize) -> Vec<String> {
                     collect(&mut paths, format!("/input/{i}/output"), text, min_bytes);
                 }
             }
+            Some("function_call") => {
+                if let Some(text) = item.get("arguments").and_then(Value::as_str) {
+                    collect(&mut paths, format!("/input/{i}/arguments"), text, min_bytes);
+                }
+            }
             Some("message") => {
                 if !matches!(
                     item.get("role").and_then(Value::as_str),
@@ -193,7 +198,8 @@ fn responses_parts(body: &Value, min_bytes: usize) -> Vec<String> {
     paths
 }
 
-/// One message part: `text` parts and `tool_result` content.
+/// One message part: `text` parts, `tool_result` content, and `tool_use`
+/// inputs — `Write.file_text`/`Edit.new_string` carry whole file bodies.
 fn collect_part(paths: &mut Vec<String>, base: &str, part: &Value, min_bytes: usize) {
     match part.get("type").and_then(Value::as_str) {
         Some("text") => {
@@ -216,6 +222,15 @@ fn collect_part(paths: &mut Vec<String>, base: &str, part: &Value, min_bytes: us
             }
             _ => {}
         },
+        Some("tool_use") => {
+            if let Some(input) = part.get("input").and_then(Value::as_object) {
+                for (key, val) in input {
+                    if let Some(text) = val.as_str() {
+                        collect(paths, format!("{base}/input/{key}"), text, min_bytes);
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -274,9 +289,9 @@ mod tests {
     #[test]
     fn test_eligible_parts_fixture() {
         let paths = eligible_parts(&fixture(), 2048);
-        // The two old tool_result texts and the old assistant text. The image
-        // data, the short text, the tool_use input, `system`, and the whole
-        // last user message are untouched.
+        // The two old tool_result texts, the old assistant text and the
+        // tool_use input field. The image data, the short text, `system`, and
+        // the whole last user message are untouched.
         assert_eq!(
             paths,
             vec![
@@ -284,6 +299,7 @@ mod tests {
                 "/messages/0/content/1/content/0/text",
                 "/messages/0/content/2/text",
                 "/messages/1/content/0/text",
+                "/messages/1/content/1/input/cmd",
             ]
         );
     }

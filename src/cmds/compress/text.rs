@@ -1,8 +1,14 @@
-//! TextCrusher: deliberately conservative. Trailing whitespace is trimmed and
-//! a run of three or more blank lines collapses to one; nothing else moves —
-//! prose has no safe rewrite.
+//! TextCrusher: mostly conservative. Trailing whitespace is trimmed and a run
+//! of three or more blank lines collapses to one; prose itself is never
+//! reworded. The one structural pass is [`fold`]: numbered near-duplicate
+//! lines (generated listings, tables, test names) share a digit-normalized
+//! shape, and a shape repeated [`MIN_TOTAL`]-plus times is gist, not prose —
+//! the original still sits behind `ccr:<id>` for retrieval.
 
-/// Crush prose: trim line tails, collapse blank runs of 3+ to a single line.
+use super::fold;
+
+/// Crush prose: trim line tails, collapse blank runs of 3+ to a single line,
+/// then fold digit-normalized near-duplicate lines.
 pub(crate) fn crush_kind(text: &str) -> String {
     let mut kept: Vec<&str> = Vec::new();
     let mut blanks = 0usize;
@@ -27,7 +33,7 @@ pub(crate) fn crush_kind(text: &str) -> String {
     if text.ends_with('\n') && !out.is_empty() {
         out.push('\n');
     }
-    out
+    fold::fold_similar(&out)
 }
 
 #[cfg(test)]

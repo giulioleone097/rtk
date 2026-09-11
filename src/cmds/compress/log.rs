@@ -8,6 +8,8 @@
 
 use crate::core::utils;
 
+use super::fold;
+
 /// The part of `line` a terminal would still show after its carriage returns.
 fn last_frame(line: &str) -> &str {
     line.rsplit('\r').find(|s| !s.is_empty()).unwrap_or("")
@@ -47,7 +49,7 @@ pub(crate) fn crush_kind(text: &str) -> String {
     if !text.ends_with('\n') && out.ends_with('\n') {
         out.pop();
     }
-    out
+    fold::fold_similar(&out)
 }
 
 #[cfg(test)]

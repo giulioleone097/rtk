@@ -2,6 +2,8 @@
 //! and prove that neither a token cited later in the session nor a block of text a
 //! later step reproduced verbatim is removed.
 
+/// `bench --compress`: measure the proxy pipeline over a request-body corpus.
+pub mod compress;
 mod filters;
 /// `bench --history`: history-vs-fresh request bytes (the proxy gate).
 pub mod history;

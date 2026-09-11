@@ -10,6 +10,7 @@
 //!   stays byte-identical between turns and prompt caching keeps working.
 
 mod code;
+mod fold;
 mod json;
 mod log;
 mod text;
@@ -25,6 +26,13 @@ use crate::core::utils;
 
 /// Originals at least this many bytes get a CCR retrieval marker when crushed.
 const CCR_MIN_BYTES: usize = 4096;
+
+/// A crushed part that is still above this carries a `ccr:` marker anyway, so
+/// it degrades to a head+tail excerpt plus the retrieval pointer.
+const HEAD_MAX_BYTES: usize = 3 * 1024;
+/// Excerpt sizes for the head/tail kept around `[elided]`.
+const HEAD_BYTES: usize = 768;
+const TAIL_BYTES: usize = 256;
 /// A crushed output at least this many percent of the input is not a win.
 const MIN_WIN_PERCENT: usize = 97;
 
@@ -206,6 +214,19 @@ fn crush_inner(text: &str, store: Option<&Store>) -> Result<Crushed> {
             // split the id off into a chunk of its own.
             let payload = format!("{source}:{text}");
             if store.index(&source, &payload).is_ok() {
+                // When even the crushed form is large, the original lives in
+                // the index anyway — keep a head/tail excerpt for gist and let
+                // the marker point at the rest.
+                if crushed.text.len() > HEAD_MAX_BYTES {
+                    let head_end = crushed.text.floor_char_boundary(HEAD_BYTES);
+                    let tail_start = crushed.text.len().saturating_sub(TAIL_BYTES);
+                    let tail_start = crushed.text.ceil_char_boundary(tail_start).max(head_end);
+                    crushed.text = format!(
+                        "{}\n… [elided]\n{}",
+                        &crushed.text[..head_end],
+                        &crushed.text[tail_start..]
+                    );
+                }
                 crushed.text.push_str(&format!(
                     "\n\n[original {in_bytes}B → ctx_search {{queries:[\"{source}\"], source:\"{source}\"}}]"
                 ));

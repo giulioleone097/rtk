@@ -16,6 +16,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use super::fold;
+
 /// `#`-lines that are code: preprocessor directives.
 static PREPROC: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -99,7 +101,7 @@ pub(crate) fn crush_kind(text: &str) -> String {
     if text.ends_with('\n') && !out.is_empty() {
         out.push('\n');
     }
-    out
+    fold::fold_similar(&out)
 }
 
 #[cfg(test)]
