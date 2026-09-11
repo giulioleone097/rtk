@@ -960,6 +960,10 @@ enum HookCommands {
     Droid,
     /// Process Mistral Vibe CLI pre_tool hook (reads JSON from stdin)
     Vibe,
+    /// Process Devin PreToolUse hook (reads JSON from stdin)
+    Devin,
+    /// Process Codex PreToolUse hook (reads JSON from stdin)
+    Codex,
     /// Check how a command would be rewritten by the hook engine (dry-run)
     Check {
         /// Target agent
@@ -2735,6 +2739,14 @@ fn run_cli() -> Result<i32> {
             }
             HookCommands::Vibe => {
                 hooks::hook_cmd::run_vibe()?;
+                0
+            }
+            HookCommands::Devin => {
+                hooks::hook_cmd::run_devin()?;
+                0
+            }
+            HookCommands::Codex => {
+                hooks::hook_cmd::run_codex()?;
                 0
             }
             HookCommands::Check { agent: _, command } => {

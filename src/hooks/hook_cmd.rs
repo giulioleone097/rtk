@@ -1015,6 +1015,358 @@ fn run_droid_inner_with_rules(
     droid_response_from_decision(&v, cmd, decide_from_verdict(cmd, verdict)).map(|o| o.to_string())
 }
 
+// ── Devin / Codex hooks ───────────────────────────────────────
+//
+// Both hosts run PreToolUse hooks on the Claude-style contract: stdin carries
+// `{"tool_name": …, "tool_input": {"command": …}}` and a rewrite is returned
+// on stdout as `{"hookSpecificOutput": {"hookEventName": "PreToolUse",
+// "updatedInput": {"command": …}}}`. Like `run_claude`, `permissionDecision:
+// "allow"` is asserted only for an explicit Allow-rule match; every other
+// rewrite lands via `updatedInput` alone, and Deny/Defer stay silent so the
+// host's native flow handles the original command. Malformed stdin produces no
+// output — a hook must never block normal operation.
+
+/// Read, BOM-strip, and parse a Claude-contract hook payload from stdin.
+fn claude_contract_stdin() -> Result<Option<Value>> {
+    let input = read_stdin_limited()?;
+    Ok(claude_contract_payload(&input))
+}
+
+/// Parse a Claude-contract payload string. Shared by the `run_*` entry points
+/// and the test paths so BOM-stripping and the warn-and-pass-through on
+/// malformed JSON are exercised identically in both.
+fn claude_contract_payload(input: &str) -> Option<Value> {
+    let input = strip_leading_bom(input).trim();
+    if input.is_empty() {
+        return None;
+    }
+    match serde_json::from_str(input) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "[rtk hook] Failed to parse JSON input: {e}");
+            None
+        }
+    }
+}
+
+/// Shared output driver for the Claude-contract hosts: emit the rewrite JSON
+/// first, then the best-effort audit line — the audit must never be what a
+/// blocked tool call waits on. Skip maps to the `skip:<reason>` actions
+/// `rtk hook audit` groups on.
+fn emit_payload_action(action: PayloadAction) {
+    match action {
+        PayloadAction::Rewrite {
+            cmd,
+            rewritten,
+            output,
+            ..
+        } => {
+            let _ = writeln!(io::stdout(), "{output}");
+            audit_log("rewrite", &cmd, &rewritten);
+        }
+        PayloadAction::Skip { decision, cmd } => {
+            let audit_action = match decision {
+                HookOutcome::Deny => "skip:deny_rule",
+                HookOutcome::Defer => "skip:defer",
+                HookOutcome::Allow | HookOutcome::Ask => "skip",
+            };
+            audit_log(audit_action, &cmd, "");
+        }
+        PayloadAction::Ignore => {}
+    }
+}
+
+// ── Devin hook ────────────────────────────────────────────────
+
+/// Extract the shell command when the payload targets Devin's `exec` tool.
+/// Claude-shaped `Bash`/`shell` names and a missing `tool_name` are tolerated
+/// defensively when a command string is present.
+fn devin_shell_command(v: &Value) -> Option<&str> {
+    let tool_name = v.get("tool_name").and_then(|t| t.as_str()).unwrap_or("");
+    if !matches!(tool_name, "exec" | "Bash" | "shell" | "") {
+        return None;
+    }
+    v.pointer("/tool_input/command")
+        .and_then(|c| c.as_str())
+        .filter(|c| !c.is_empty())
+}
+
+fn process_devin_payload(v: &Value) -> PayloadAction {
+    process_devin_payload_with(v, |cmd| decide_hook_action(cmd, permissions::Host::Devin))
+}
+
+fn process_devin_payload_with(
+    v: &Value,
+    decide: impl FnOnce(&str) -> HookDecision,
+) -> PayloadAction {
+    let cmd = match devin_shell_command(v) {
+        Some(c) => c,
+        None => return PayloadAction::Ignore,
+    };
+    process_claude_payload_from_decision(v, cmd, decide(cmd))
+}
+
+/// Run the Devin PreToolUse hook natively.
+pub fn run_devin() -> Result<()> {
+    if let Some(v) = claude_contract_stdin()? {
+        emit_payload_action(process_devin_payload(&v));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn run_devin_inner(input: &str) -> Option<String> {
+    run_devin_inner_with_rules(input, &[], &[], &[])
+}
+
+#[cfg(test)]
+fn run_devin_inner_with_rules(
+    input: &str,
+    deny_rules: &[String],
+    ask_rules: &[String],
+    allow_rules: &[String],
+) -> Option<String> {
+    let v = claude_contract_payload(input)?;
+    match process_devin_payload_with(&v, |cmd| {
+        decide_from_verdict(
+            cmd,
+            permissions::check_command_with_rules(cmd, deny_rules, ask_rules, allow_rules),
+        )
+    }) {
+        PayloadAction::Rewrite { output, .. } => Some(output.to_string()),
+        _ => None,
+    }
+}
+
+// ── Codex hook ────────────────────────────────────────────────
+//
+// codex-rs serializes shell tool calls to hooks as `tool_name: "Bash"` with
+// `tool_input.command` a plain string — `exec_command`'s `cmd` field is a
+// `String` (see codex-rs `handlers/unified_exec/exec_command.rs`
+// `pre_tool_use_payload`), and `updatedInput.command` is read back as a string
+// (`handlers/mod.rs` `updated_hook_command`). The array form is defensive
+// cover for Claude-contract hosts that pass argv instead.
+
+/// The command extracted from a Codex-shaped payload, keeping enough of the
+/// original shape to emit the rewrite back in the same form.
+enum CodexCommand<'a> {
+    /// `{"command": "<cmd>"}` — what codex-rs emits for `exec_command`.
+    Str(&'a str),
+    /// `["<shell>", "-c"|"-lc", "<cmd>"]` — rewrite the last element only.
+    ShellTriple {
+        elems: &'a [Value],
+        cmd_index: usize,
+    },
+    /// Bare argv like `["git","status"]`, reached only when every element is a
+    /// simple arg so the space-join is unambiguous for analysis.
+    Argv { joined: String },
+}
+
+impl CodexCommand<'_> {
+    /// The string `decide_hook_action` analyzes.
+    fn analysis(&self) -> &str {
+        match self {
+            CodexCommand::Str(s) => s,
+            CodexCommand::ShellTriple { elems, cmd_index } => {
+                elems[*cmd_index].as_str().unwrap_or("")
+            }
+            CodexCommand::Argv { joined } => joined,
+        }
+    }
+
+    /// Rebuild `tool_input.command` with `rewritten` applied, preserving the
+    /// payload's original shape. `None` when the rewrite can't be expressed
+    /// element-wise (argv whose rewritten form needs quoting or metachars) —
+    /// the host then runs the original command unchanged.
+    fn with_rewritten(&self, rewritten: &str) -> Option<Value> {
+        match self {
+            CodexCommand::Str(_) => Some(Value::String(rewritten.to_string())),
+            CodexCommand::ShellTriple { elems, cmd_index } => {
+                let mut out = elems.to_vec();
+                out[*cmd_index] = Value::String(rewritten.to_string());
+                Some(Value::Array(out))
+            }
+            CodexCommand::Argv { .. } => rewritten
+                .split(' ')
+                .map(|t| is_simple_arg(t).then(|| Value::String(t.to_string())))
+                .collect::<Option<Vec<_>>>()
+                .map(Value::Array),
+        }
+    }
+}
+
+/// Extract the command when the payload targets a Codex shell tool. `Bash` is
+/// the canonical hook name codex-rs serializes for `exec_command`/`shell`;
+/// the tool-arg names and a missing `tool_name` are tolerated defensively.
+/// `apply_patch` also carries a `command` field but holds patch text, not a
+/// shell command — it is not matched.
+fn codex_shell_command(v: &Value) -> Option<CodexCommand<'_>> {
+    let tool_name = v.get("tool_name").and_then(|t| t.as_str()).unwrap_or("");
+    if !matches!(
+        tool_name,
+        "Bash" | "exec_command" | "shell" | "local_shell" | ""
+    ) {
+        return None;
+    }
+    match v.pointer("/tool_input/command")? {
+        Value::String(s) if !s.is_empty() => Some(CodexCommand::Str(s)),
+        Value::Array(elems) => codex_argv_command(elems),
+        _ => None,
+    }
+}
+
+fn codex_argv_command(elems: &[Value]) -> Option<CodexCommand<'_>> {
+    // The `["<shell>", "-c"|"-lc", "<cmd>"]` triple is checked before the
+    // bare-argv arm: rewriting only the last element preserves the invocation.
+    if elems.len() == 3
+        && elems[0].as_str().is_some_and(is_shell_name)
+        && matches!(elems[1].as_str(), Some("-c" | "-lc"))
+        && elems[2].as_str().is_some_and(|c| !c.is_empty())
+    {
+        return Some(CodexCommand::ShellTriple {
+            elems,
+            cmd_index: 2,
+        });
+    }
+    // Bare argv: joining is only unambiguous when every element is a simple
+    // arg — anything needing quoting or carrying metacharacters is skipped.
+    let args: Option<Vec<&str>> = elems.iter().map(Value::as_str).collect();
+    let args = args?;
+    if !args.is_empty() && args.iter().all(|a| is_simple_arg(a)) {
+        return Some(CodexCommand::Argv {
+            joined: args.join(" "),
+        });
+    }
+    None
+}
+
+/// Whether `arg` names a shell binary (`bash`, `/bin/sh`, `pwsh.exe`, …).
+fn is_shell_name(arg: &str) -> bool {
+    let base = arg.rsplit(['/', '\\']).next().unwrap_or_default();
+    let base = base.strip_suffix(".exe").unwrap_or(base);
+    matches!(
+        base.to_ascii_lowercase().as_str(),
+        "sh" | "bash" | "zsh" | "dash" | "ash" | "ksh" | "fish" | "pwsh" | "powershell" | "cmd"
+    )
+}
+
+/// An argv element is "simple" when splitting/joining on spaces is
+/// unambiguous: no whitespace, quoting, globbing, or shell metacharacters.
+fn is_simple_arg(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | '.' | '/' | ':' | '=' | '@' | '+' | ',' | '%')
+        })
+}
+
+fn codex_response_from_decision(
+    v: &Value,
+    cmd: CodexCommand<'_>,
+    decision: HookDecision,
+) -> PayloadAction {
+    let analysis = cmd.analysis().to_string();
+    let (rewritten, allow) = match decision {
+        HookDecision::Deny => {
+            return PayloadAction::Skip {
+                decision: HookOutcome::Deny,
+                cmd: analysis,
+            };
+        }
+        HookDecision::Defer => {
+            return PayloadAction::Skip {
+                decision: HookOutcome::Defer,
+                cmd: analysis,
+            };
+        }
+        HookDecision::AllowRewrite(r) => (r, true),
+        HookDecision::AskRewrite(r) => (r, false),
+    };
+
+    let Some(command) = cmd.with_rewritten(&rewritten) else {
+        return PayloadAction::Skip {
+            decision: HookOutcome::Defer,
+            cmd: analysis,
+        };
+    };
+
+    let updated_input = {
+        let mut ti = v.get("tool_input").cloned().unwrap_or_else(|| json!({}));
+        if let Some(obj) = ti.as_object_mut() {
+            obj.insert("command".into(), command);
+        }
+        ti
+    };
+
+    let mut hook_output = json!({
+        "hookEventName": PRE_TOOL_USE_KEY,
+        "permissionDecisionReason": "RTK auto-rewrite",
+        "updatedInput": updated_input
+    });
+    if allow {
+        hook_output["permissionDecision"] = json!("allow");
+    }
+
+    PayloadAction::Rewrite {
+        cmd: analysis,
+        rewritten,
+        decision: if allow {
+            HookOutcome::Allow
+        } else {
+            HookOutcome::Ask
+        },
+        output: json!({ "hookSpecificOutput": hook_output }),
+    }
+}
+
+fn process_codex_payload(v: &Value) -> PayloadAction {
+    process_codex_payload_with(v, |cmd| decide_hook_action(cmd, permissions::Host::Codex))
+}
+
+fn process_codex_payload_with(
+    v: &Value,
+    decide: impl FnOnce(&str) -> HookDecision,
+) -> PayloadAction {
+    let cmd = match codex_shell_command(v) {
+        Some(c) => c,
+        None => return PayloadAction::Ignore,
+    };
+    let analysis = cmd.analysis().to_string();
+    codex_response_from_decision(v, cmd, decide(&analysis))
+}
+
+/// Run the Codex PreToolUse hook natively.
+pub fn run_codex() -> Result<()> {
+    if let Some(v) = claude_contract_stdin()? {
+        emit_payload_action(process_codex_payload(&v));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn run_codex_inner(input: &str) -> Option<String> {
+    run_codex_inner_with_rules(input, &[], &[], &[])
+}
+
+#[cfg(test)]
+fn run_codex_inner_with_rules(
+    input: &str,
+    deny_rules: &[String],
+    ask_rules: &[String],
+    allow_rules: &[String],
+) -> Option<String> {
+    let v = claude_contract_payload(input)?;
+    match process_codex_payload_with(&v, |cmd| {
+        decide_from_verdict(
+            cmd,
+            permissions::check_command_with_rules(cmd, deny_rules, ask_rules, allow_rules),
+        )
+    }) {
+        PayloadAction::Rewrite { output, .. } => Some(output.to_string()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2517,5 +2869,348 @@ mod tests {
     fn test_vibe_substitution_defers() {
         let input = vibe_input("bash", "echo $(rm -rf /)");
         assert!(run_vibe_inner(&input).is_none());
+    }
+
+    // --- Devin hook ---
+
+    fn devin_input(tool: &str, cmd: &str) -> String {
+        json!({
+            "session_id": "abc123",
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool,
+            "tool_input": { "command": cmd }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_devin_rewrites_exec_tool() {
+        // Devin's shell tool is `exec`; the rewrite lands via `updatedInput`.
+        let input = devin_input("exec", "git status");
+        let out = run_devin_inner(&input).expect("rewrite expected");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/updatedInput/command")
+                .and_then(|c| c.as_str()),
+            Some("tokenaut git status")
+        );
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/hookEventName")
+                .and_then(|c| c.as_str()),
+            Some("PreToolUse")
+        );
+    }
+
+    #[test]
+    fn test_devin_tolerates_claude_shaped_tool_names() {
+        // `Bash`/`shell`/missing tool_name are tolerated when a command string
+        // is present — Devin payloads are Claude-shaped.
+        for tool in ["Bash", "shell"] {
+            let input = devin_input(tool, "git status");
+            assert!(run_devin_inner(&input).is_some(), "{tool} must rewrite");
+        }
+        let input = json!({ "tool_input": { "command": "git status" } }).to_string();
+        assert!(
+            run_devin_inner(&input).is_some(),
+            "missing tool_name must rewrite"
+        );
+    }
+
+    #[test]
+    fn test_devin_ignores_non_exec_tool() {
+        let input = devin_input("Edit", "git status");
+        assert!(run_devin_inner(&input).is_none());
+    }
+
+    #[test]
+    fn test_devin_default_verdict_omits_decision() {
+        // With no Devin permission rules the verdict is Default — the rewrite
+        // lands via updatedInput alone and Devin's own flow decides.
+        let input = devin_input("exec", "cargo build");
+        let out = run_devin_inner(&input).expect("rewrite expected");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v
+            .pointer("/hookSpecificOutput/permissionDecision")
+            .is_none());
+        assert!(v
+            .pointer("/hookSpecificOutput/updatedInput/command")
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| c.starts_with("tokenaut ")));
+    }
+
+    #[test]
+    fn test_devin_allow_rule_asserts_allow() {
+        // Mirrors run_claude: permissionDecision "allow" is asserted only on an
+        // explicit allow-rule match.
+        let input = devin_input("exec", "git status");
+        let out = run_devin_inner_with_rules(&input, &[], &[], &["*".to_string()])
+            .expect("rewrite expected");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/permissionDecision"),
+            Some(&json!("allow"))
+        );
+    }
+
+    #[test]
+    fn test_devin_deny_rule_steps_aside() {
+        // A deny rule must produce NO output so Devin's native deny handling
+        // fires on the original command.
+        let input = devin_input("exec", "git push --force");
+        assert!(
+            run_devin_inner_with_rules(&input, &["git push:*".to_string()], &[], &[]).is_none(),
+            "denied command must step aside (no output)"
+        );
+    }
+
+    #[test]
+    fn test_devin_strips_utf8_bom() {
+        let input = format!("\u{feff}{}", devin_input("exec", "git status"));
+        let out = run_devin_inner(&input).expect("BOM-prefixed payload must parse");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/updatedInput/command")
+                .and_then(|c| c.as_str()),
+            Some("tokenaut git status")
+        );
+    }
+
+    #[test]
+    fn test_devin_malformed_json_passes_through() {
+        assert!(run_devin_inner("not json at all").is_none());
+        assert!(run_devin_inner("{ unterminated").is_none());
+        assert!(run_devin_inner("").is_none());
+    }
+
+    #[test]
+    fn test_devin_unknown_binary_passthrough() {
+        let input = devin_input("exec", "definitely-not-a-real-binary --foo");
+        assert!(run_devin_inner(&input).is_none());
+    }
+
+    #[test]
+    fn test_devin_substitution_defers() {
+        for cmd in ["git status `rm -rf /tmp/x`", "git status $(rm -rf /tmp/x)"] {
+            let input = devin_input("exec", cmd);
+            assert!(
+                run_devin_inner(&input).is_none(),
+                "substitution must defer (no output) for {cmd}"
+            );
+        }
+    }
+
+    // --- Codex hook ---
+
+    fn codex_input(tool: &str, cmd: &str) -> String {
+        json!({
+            "session_id": "abc123",
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool,
+            "tool_input": { "command": cmd }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_codex_rewrites_bash_tool() {
+        // codex-rs serializes exec_command hooks as tool_name "Bash" with a
+        // string command; the rewrite goes back as a string.
+        let input = codex_input("Bash", "git status");
+        let out = run_codex_inner(&input).expect("rewrite expected");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/updatedInput/command")
+                .and_then(|c| c.as_str()),
+            Some("tokenaut git status")
+        );
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/hookEventName")
+                .and_then(|c| c.as_str()),
+            Some("PreToolUse")
+        );
+    }
+
+    #[test]
+    fn test_codex_rewrites_shell_triple() {
+        // `["<shell>", "-c"|"-lc", "<cmd>"]` — only the last element is
+        // rewritten and the array shape is preserved in updatedInput.
+        for flag in ["-c", "-lc"] {
+            let input = json!({
+                "tool_name": "Bash",
+                "tool_input": { "command": ["bash", flag, "git status"] }
+            })
+            .to_string();
+            let out = run_codex_inner(&input).expect("rewrite expected");
+            let v: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(
+                v.pointer("/hookSpecificOutput/updatedInput/command"),
+                Some(&json!(["bash", flag, "tokenaut git status"])),
+                "triple with {flag} must rewrite the last element"
+            );
+        }
+    }
+
+    #[test]
+    fn test_codex_shell_triple_requires_shell_name() {
+        // A non-shell first element (`git -c` is a real git flag form) is a
+        // bare argv, not a shell triple — the argv arm decides.
+        let input = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": ["git", "-c", "color.ui=always", "status"] }
+        })
+        .to_string();
+        let out = run_codex_inner(&input).expect("rewrite expected");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/updatedInput/command"),
+            Some(&json!([
+                "tokenaut",
+                "git",
+                "-c",
+                "color.ui=always",
+                "status"
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_codex_bare_argv_rewrites_element_wise() {
+        // Simple argv → analyzed by its unambiguous join, emitted element-wise.
+        let input = json!({
+            "tool_name": "exec_command",
+            "tool_input": { "command": ["git", "status"] }
+        })
+        .to_string();
+        let out = run_codex_inner(&input).expect("rewrite expected");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/updatedInput/command"),
+            Some(&json!(["tokenaut", "git", "status"]))
+        );
+    }
+
+    #[test]
+    fn test_codex_argv_with_metachars_skips() {
+        // Elements needing shell interpretation can't be joined unambiguously
+        // — no rewrite, no output.
+        for cmd in [
+            json!(["git", "status && rm -rf /tmp/x"]),
+            json!(["git", "status", "&&", "cargo", "build"]),
+            json!(["echo", "a b"]),
+        ] {
+            let input =
+                json!({ "tool_name": "Bash", "tool_input": { "command": cmd } }).to_string();
+            assert!(
+                run_codex_inner(&input).is_none(),
+                "argv {cmd} must pass through (no output)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_codex_argv_unwritable_rewrite_skips() {
+        // A rewrite that can't be expressed as simple argv elements (here the
+        // rewritten form contains a quoted arg) must step aside silently.
+        let input = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": ["git", "status"] }
+        })
+        .to_string();
+        let v: Value = serde_json::from_str(&input).unwrap();
+        let cmd = codex_shell_command(&v).expect("argv must parse");
+        let action = codex_response_from_decision(
+            &v,
+            cmd,
+            HookDecision::AllowRewrite("tokenaut git log --format='%H'".to_string()),
+        );
+        assert!(
+            matches!(action, PayloadAction::Skip { .. }),
+            "unwritable argv rewrite must step aside"
+        );
+    }
+
+    #[test]
+    fn test_codex_ignores_apply_patch_tool() {
+        // apply_patch also sends a `command` field — patch text, not a shell
+        // command. It must never be rewritten.
+        let input = codex_input("apply_patch", "git status");
+        assert!(run_codex_inner(&input).is_none());
+    }
+
+    #[test]
+    fn test_codex_ignores_non_shell_tool() {
+        let input = codex_input("view_image", "git status");
+        assert!(run_codex_inner(&input).is_none());
+    }
+
+    #[test]
+    fn test_codex_missing_tool_name_accepted() {
+        // Defensive: a Claude-shaped payload without tool_name still rewrites
+        // when a command string is present.
+        let input = json!({ "tool_input": { "command": "git status" } }).to_string();
+        assert!(run_codex_inner(&input).is_some());
+    }
+
+    #[test]
+    fn test_codex_default_verdict_omits_decision() {
+        let input = codex_input("Bash", "cargo build");
+        let out = run_codex_inner(&input).expect("rewrite expected");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v
+            .pointer("/hookSpecificOutput/permissionDecision")
+            .is_none());
+    }
+
+    #[test]
+    fn test_codex_allow_rule_asserts_allow() {
+        let input = codex_input("Bash", "git status");
+        let out = run_codex_inner_with_rules(&input, &[], &[], &["*".to_string()])
+            .expect("rewrite expected");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/permissionDecision"),
+            Some(&json!("allow"))
+        );
+    }
+
+    #[test]
+    fn test_codex_strips_utf8_bom() {
+        let input = format!("\u{feff}{}", codex_input("Bash", "git status"));
+        let out = run_codex_inner(&input).expect("BOM-prefixed payload must parse");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/updatedInput/command")
+                .and_then(|c| c.as_str()),
+            Some("tokenaut git status")
+        );
+    }
+
+    #[test]
+    fn test_codex_malformed_json_passes_through() {
+        assert!(run_codex_inner("not json at all").is_none());
+        assert!(run_codex_inner("{ unterminated").is_none());
+        assert!(run_codex_inner("").is_none());
+    }
+
+    #[test]
+    fn test_codex_non_string_command_passthrough() {
+        // command as object/number/null → nothing to analyze.
+        for cmd in [json!({}), json!(42), Value::Null] {
+            let input =
+                json!({ "tool_name": "Bash", "tool_input": { "command": cmd } }).to_string();
+            assert!(run_codex_inner(&input).is_none());
+        }
+    }
+
+    #[test]
+    fn test_codex_unknown_binary_passthrough() {
+        let input = codex_input("Bash", "definitely-not-a-real-binary --foo");
+        assert!(run_codex_inner(&input).is_none());
+    }
+
+    #[test]
+    fn test_codex_substitution_defers() {
+        let input = codex_input("Bash", "git status $(rm -rf /tmp/x)");
+        assert!(run_codex_inner(&input).is_none());
     }
 }

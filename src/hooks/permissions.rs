@@ -38,6 +38,8 @@ pub enum Host {
     Gemini,
     Droid,
     Vibe,
+    Devin,
+    Codex,
 }
 
 pub fn check_command_for(cmd: &str, host: Host) -> PermissionVerdict {
@@ -57,7 +59,10 @@ pub(crate) fn load_rules_for(host: Host) -> (Vec<String>, Vec<String>, Vec<Strin
         Host::Cursor => load_cursor_rules(),
         Host::Gemini => load_gemini_rules(),
         Host::Droid => load_droid_rules(),
-        Host::Vibe => (Vec::new(), Vec::new(), Vec::new()),
+        // Vibe, Devin, and Codex expose no permission settings tokenaut can
+        // load — empty rule sets keep every rewrite at the least-privileged
+        // Default (ask) verdict, leaving the host's own prompt flow in charge.
+        Host::Vibe | Host::Devin | Host::Codex => (Vec::new(), Vec::new(), Vec::new()),
     }
 }
 
