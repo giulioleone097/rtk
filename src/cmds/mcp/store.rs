@@ -2,14 +2,20 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 /// Upper bound, in characters, of an indexed chunk.
 const MAX_CHUNK_CHARS: usize = 1500;
 /// Schema of the index. Bumped whenever the tables change shape.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+/// Days a chunk stays indexed before `open` prunes it;
+/// `TOKENAUT_INDEX_MAX_AGE_DAYS` overrides.
+const DEFAULT_MAX_AGE_DAYS: i64 = 30;
+/// Upper bound on indexed chunks — newest by insertion order are kept;
+/// `TOKENAUT_INDEX_MAX_CHUNKS` overrides.
+const DEFAULT_MAX_CHUNKS: i64 = 200_000;
 
 /// What one call to [`Store::index`] wrote.
 pub struct Indexed {
@@ -41,10 +47,14 @@ impl Store {
         Self::open(&dir.join("index.sqlite"))
     }
 
-    /// Open (creating if missing) the index at `path`. `source` is UNINDEXED so
-    /// a query that happens to equal a label matches only real content.
+    /// Open (creating if missing) the index at `path`, then prune it. `source`
+    /// is UNINDEXED so a query that happens to equal a label matches only real
+    /// content; `key` is UNINDEXED too — it dedups, it should not be searched.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        // WAL so a writer does not block readers; NORMAL is the standard
+        // pairing since WAL already checksums every commit frame.
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version < SCHEMA_VERSION {
             // The index is a cache of fetched and executed output: rebuilding
@@ -56,12 +66,18 @@ impl Store {
                  source UNINDEXED,
                  content,
                  ts UNINDEXED,
+                 key UNINDEXED,
                  tokenize = 'unicode61'
              );
              CREATE TABLE IF NOT EXISTS chunk_keys (key TEXT PRIMARY KEY);
              PRAGMA user_version = {SCHEMA_VERSION};"
         ))?;
-        Ok(Self { conn })
+        let store = Self { conn };
+        store.prune(
+            env_or("TOKENAUT_INDEX_MAX_AGE_DAYS", DEFAULT_MAX_AGE_DAYS),
+            env_or("TOKENAUT_INDEX_MAX_CHUNKS", DEFAULT_MAX_CHUNKS),
+        )?;
+        Ok(store)
     }
 
     /// Chunk `text` and index every chunk not yet stored under `source`.
@@ -73,16 +89,18 @@ impl Store {
             .prepare("INSERT OR IGNORE INTO chunk_keys(key) VALUES (?1)")?;
         let mut insert = self
             .conn
-            .prepare("INSERT INTO chunks(source, content, ts) VALUES (?1, ?2, ?3)")?;
+            .prepare("INSERT INTO chunks(source, content, ts, key) VALUES (?1, ?2, ?3, ?4)")?;
         let mut skipped = 0;
         for content in &chunks {
             // Claiming the key first keeps a re-run of the same command from
-            // filling the bm25 slots with copies of itself.
-            if claim.execute((chunk_key(source, content),))? == 0 {
+            // filling the bm25 slots with copies of itself. The key is stored
+            // on the row too so pruning can drop it with its chunk.
+            let key = chunk_key(source, content);
+            if claim.execute((&key,))? == 0 {
                 skipped += 1;
                 continue;
             }
-            insert.execute((source, content, &ts))?;
+            insert.execute((source, content, &ts, &key))?;
         }
         Ok(Indexed {
             chunks: chunks.len(),
@@ -115,6 +133,57 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(sections)
     }
+
+    /// Drop chunks past the age and count caps, along with their dedup keys,
+    /// then incrementally merge the FTS5 index. Runs once per `open` — the
+    /// caps bound the scan, and the index is a rebuildable cache anyway.
+    fn prune(&self, max_age_days: i64, max_chunks: i64) -> Result<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("prune: begin transaction")?;
+        // ceiling: `ts` is `Local::now().to_rfc3339()`, so the cutoff is built
+        // the same way and the lexicographic compare stays in the same offset
+        // family. Chunks written under a different local offset can sort
+        // slightly off — acceptable for a cache; store `ts` in UTC if the
+        // index ever crosses time zones.
+        // ceiling: the days cap is clamped so `TimeDelta::days` cannot panic
+        // on an absurd override; ~1000 years ago reads as "keep everything".
+        let days = max_age_days.min(365_000);
+        let cutoff = (chrono::Local::now() - chrono::TimeDelta::days(days)).to_rfc3339();
+        // Each cap deletes the doomed rows' keys first: a key outliving its
+        // chunk would make a later `index` call "skip" content that is no
+        // longer searchable, so it could never be re-indexed.
+        tx.execute(
+            "DELETE FROM chunk_keys WHERE key IN (
+                 SELECT key FROM chunks WHERE ts < ?1)",
+            (&cutoff,),
+        )
+        .context("prune: keys of aged chunks")?;
+        let mut pruned = tx
+            .execute("DELETE FROM chunks WHERE ts < ?1", (&cutoff,))
+            .context("prune: aged chunks")?;
+        tx.execute(
+            "DELETE FROM chunk_keys WHERE key IN (
+                 SELECT key FROM chunks WHERE rowid NOT IN (
+                     SELECT rowid FROM chunks ORDER BY rowid DESC LIMIT ?1))",
+            (max_chunks,),
+        )
+        .context("prune: keys of over-cap chunks")?;
+        pruned += tx
+            .execute(
+                "DELETE FROM chunks WHERE rowid NOT IN (
+                     SELECT rowid FROM chunks ORDER BY rowid DESC LIMIT ?1)",
+                (max_chunks,),
+            )
+            .context("prune: over-cap chunks")?;
+        if pruned > 0 {
+            tx.execute("INSERT INTO chunks(chunks) VALUES('optimize')", [])
+                .context("prune: fts5 optimize")?;
+        }
+        tx.commit().context("prune: commit")?;
+        Ok(())
+    }
 }
 
 /// Quote every term so client punctuation cannot be read as FTS5 syntax, and
@@ -126,6 +195,19 @@ fn fts_query(query: &str) -> String {
         .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" OR ")
+}
+
+/// `name`d env var as a non-negative integer, else `default`. Read at call
+/// time — never baked into a `const` — so tests can override it per run. Only
+/// the count-cap test sets `TOKENAUT_INDEX_MAX_CHUNKS`, with a cap above every
+/// other test's chunk count, so a store another test opens concurrently while
+/// the var is set still prunes nothing.
+fn env_or(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|&value| value >= 0)
+        .unwrap_or(default)
 }
 
 /// Identity of a chunk within one source, for the duplicate guard.
@@ -279,5 +361,82 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
         assert!(store.search("stale", 10, None).unwrap().is_empty());
         assert!(store.search("zebra", 10, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_index_opens_in_wal_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("index.sqlite")).unwrap();
+        let mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+    }
+
+    #[test]
+    fn aged_chunks_and_their_keys_are_pruned_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        Store::open(&path)
+            .unwrap()
+            .index("exec:old", "the stale needle")
+            .unwrap();
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .conn
+                .execute("UPDATE chunks SET ts = '2000-01-01T00:00:00+00:00'", [])
+                .unwrap();
+        }
+        // The row is older than the default age cap: reopening prunes it along
+        // with its dedup key, so a re-index inserts instead of skipping.
+        let store = Store::open(&path).unwrap();
+        assert!(store.search("stale", 10, None).unwrap().is_empty());
+        let indexed = store.index("exec:old", "the stale needle").unwrap();
+        assert_eq!(indexed.skipped, 0);
+        assert_eq!(indexed.chunks, 1);
+        assert_eq!(store.search("stale", 10, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn chunks_past_the_count_cap_are_pruned_oldest_first() {
+        // `Store::open` reads TOKENAUT_INDEX_MAX_CHUNKS at call time, so this
+        // test — the only one that mutates it — sets a cap above every other
+        // test's chunk count: a store opened concurrently mid-test still
+        // prunes nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        std::env::set_var("TOKENAUT_INDEX_MAX_CHUNKS", "3");
+        {
+            let store = Store::open(&path).unwrap();
+            for i in 0..5 {
+                store
+                    .index("exec:big", &format!("chunk number {i} unique{i}"))
+                    .unwrap();
+            }
+        }
+        let store = Store::open(&path).unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
+            .unwrap();
+        let oldest_gone = store.search("unique0", 10, None).unwrap().is_empty()
+            && store.search("unique1", 10, None).unwrap().is_empty();
+        let newest_kept = store.search("unique4", 10, None).unwrap().len();
+        let mut skipped = 0;
+        for i in 0..5 {
+            skipped += store
+                .index("exec:big", &format!("chunk number {i} unique{i}"))
+                .unwrap()
+                .skipped;
+        }
+        std::env::remove_var("TOKENAUT_INDEX_MAX_CHUNKS");
+        assert_eq!(count, 3);
+        assert!(oldest_gone);
+        assert_eq!(newest_kept, 1);
+        // The pruned rows' keys went with them, so those two chunks
+        // re-insert; the three survivors still dedup.
+        assert_eq!(skipped, 3);
     }
 }
