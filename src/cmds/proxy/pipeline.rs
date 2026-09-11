@@ -12,6 +12,9 @@
 
 use anyhow::Result;
 use serde_json::Value;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 use crate::cmds::compress::Crushed;
 
@@ -102,17 +105,32 @@ pub fn process_body(body: &[u8], min_bytes: usize, crush: Crusher) -> (Vec<u8>, 
         return (body.to_vec(), 0);
     };
     let mut replaced = 0;
+    // Cross-part dedup: a byte-identical repeat of an earlier part (the model
+    // re-read a file, re-ran a command) collapses to a back-reference — keyed
+    // on (len, hash) so no full-text copies are retained.
+    let mut seen: HashMap<(usize, u64), String> = HashMap::new();
     for path in eligible_parts(&doc, min_bytes) {
+        let current = doc.pointer(&path).and_then(Value::as_str).unwrap_or("");
+        let mut h = DefaultHasher::new();
+        current.hash(&mut h);
+        let key = (current.len(), h.finish());
+        if let Some(first) = seen.get(&key) {
+            if let Some(Value::String(slot)) = doc.pointer_mut(&path) {
+                *slot = format!("↩ identical to {first} (same text, not repeated)");
+                replaced += 1;
+                continue;
+            }
+        }
+        seen.insert(key, path.clone());
         if crush_at(&mut doc, &path, crush).is_some() {
             replaced += 1;
         }
     }
-    if replaced == 0 {
-        return (body.to_vec(), 0);
-    }
     match serde_json::to_vec(&doc) {
-        Ok(bytes) => (bytes, replaced),
-        Err(_) => (body.to_vec(), 0),
+        // Even with nothing crushed, a re-serialize strips pretty-print
+        // whitespace the client added — a free, byte-safe win.
+        Ok(bytes) if replaced > 0 || bytes.len() < body.len() => (bytes, replaced),
+        _ => (body.to_vec(), 0),
     }
 }
 

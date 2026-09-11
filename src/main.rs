@@ -932,7 +932,7 @@ enum Commands {
         #[arg(long = "compress", num_args = 1..)]
         compress_corpus: Vec<PathBuf>,
         /// Smallest message-part length eligible for compression (--compress)
-        #[arg(long, default_value_t = 512)]
+        #[arg(long, default_value_t = 256)]
         min_bytes: usize,
     },
     /// Run the MCP server over stdio (tools: ctx_batch_execute, ctx_search)
@@ -948,7 +948,7 @@ enum Commands {
         #[arg(long, default_value = "https://api.anthropic.com")]
         upstream: String,
         /// Smallest message-part length in bytes eligible for compression
-        #[arg(long, default_value_t = 512)]
+        #[arg(long, default_value_t = 256)]
         min_bytes: usize,
     },
 }
