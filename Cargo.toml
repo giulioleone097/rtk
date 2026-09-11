@@ -1,10 +1,10 @@
 [package]
 name = "tokenaut"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.91"
 authors = ["Patrick Szymkowiak"]
-description = "Token-saving hook engine and bench for Claude Code, based on rtk 0.48.0"
+description = "Token-saving hook engine, context MCP, bench and API compression proxy for Claude Code (rtk + context-mode + headroom ideas, based on rtk 0.48.0)"
 license = "Apache 2.0"
 homepage = "https://www.rtk-ai.app"
 repository = "https://github.com/rtk-ai/rtk"
